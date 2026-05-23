@@ -24,13 +24,12 @@ rule Forensic_Messengers
         $discord_3 = "discord.com/channels/" nocase ascii wide
         $discord_4 = "cdn.discordapp.com/attachments/" nocase ascii wide
 
-        // WhatsApp & Signal
+        // WhatsApp 
         $wa_1 = "wa.me/" nocase ascii wide
         $wa_2 = "chat.whatsapp.com/" nocase ascii wide
         $signal_1 = "signal.group/#" nocase ascii wide
         $signal_2 = "sgnl://" nocase ascii wide
 
-        // Защищенные мессенджеры (Tox, Session, Threema, Jabber)
         $tox_1 = "tox:" nocase ascii wide
         $tox_2 = "qTox" nocase ascii wide
         $session_1 = "getsession.org" nocase ascii wide
@@ -48,7 +47,6 @@ rule Forensic_Cloud_and_Sharing
         category = "Data Exfiltration"
 
     strings:
-        // Популярные облака
         $mega_1 = "mega.nz/file/" nocase ascii wide
         $mega_2 = "mega.nz/folder/" nocase ascii wide
         $mega_3 = "mega.co.nz" nocase ascii wide
@@ -59,7 +57,6 @@ rule Forensic_Cloud_and_Sharing
         $yandex_1 = "disk.yandex.ru/d/" nocase ascii wide
         $mailru_1 = "cloud.mail.ru/public/" nocase ascii wide
 
-        // Анонимные / Временные файлообменники и заметки
         $pastebin_1 = "pastebin.com/" nocase ascii wide
         $privnote_1 = "privnote.com/" nocase ascii wide
         $anonfiles_1 = "anonfiles.com/" nocase ascii wide
@@ -79,8 +76,7 @@ rule Forensic_DarkWeb_Tor_I2P
         category = "Darknet"
 
     strings:
-        // Tor (.onion) - ищем классические v2 и современные v3 адреса
-        // Регулярные выражения для onion (v2 - 16 символов, v3 - 56 символов)
+
         $onion_v3 = /[a-z2-7]{56}\.onion/ nocase ascii wide
         $onion_v2 = /[a-z2-7]{16}\.onion/ nocase ascii wide
         $tor_gateway = ".onion.ws" nocase ascii wide
@@ -102,28 +98,24 @@ rule Forensic_Crypto_Artifacts
         category = "Finance"
 
     strings:
-        // Ссылки на блокчейн-эксплореры
         $bc_1 = "blockchain.info/tx/" nocase ascii wide
         $bc_2 = "blockchair.com/" nocase ascii wide
         $bc_3 = "etherscan.io/address/" nocase ascii wide
         $bc_4 = "tronscan.org/#/address/" nocase ascii wide
         $bc_5 = "xmrchain.net/tx/" nocase ascii wide
 
-        // Биржи и обменники
         $ex_1 = "binance.com" nocase ascii wide
         $ex_2 = "coinbase.com" nocase ascii wide
         $ex_3 = "kraken.com" nocase ascii wide
         $ex_4 = "localmonero.co" nocase ascii wide
         $ex_5 = "bestchange.ru" nocase ascii wide
 
-        // Характерные URI-схемы криптокошельков
         $uri_1 = "bitcoin:" nocase ascii wide
         $uri_2 = "ethereum:" nocase ascii wide
         $uri_3 = "monero:" nocase ascii wide
         $uri_4 = "litecoin:" nocase ascii wide
         $uri_5 = "tron:" nocase ascii wide
 
-        // Популярные софтверные кошельки
         $wallet_1 = "Electrum" ascii wide
         $wallet_2 = "Exodus" ascii wide
         $wallet_3 = "MetaMask" nocase ascii wide
@@ -140,13 +132,12 @@ rule Forensic_Suspicious_Infra
         category = "Infrastructure"
 
     strings:
-        // Туннели (часто используются для бэкдоров и фишинга)
         $ngrok_1 = ".ngrok.io" nocase ascii wide
         $ngrok_2 = ".ngrok-free.app" nocase ascii wide
         $localtunnel = ".loca.lt" nocase ascii wide
         $serveo = "serveo.net" nocase ascii wide
 
-        // DDNS (Dynamic DNS)
+        // DDNS
         $ddns_1 = ".duckdns.org" nocase ascii wide
         $ddns_2 = ".no-ip.com" nocase ascii wide
         $ddns_3 = ".no-ip.org" nocase ascii wide
