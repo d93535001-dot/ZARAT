@@ -78,16 +78,16 @@ class ForensicLogger:
     def __init__(self):
         self.log_dir = Path(tempfile.gettempdir()) / "DeepDriveLogs"
         self.log_dir.mkdir(exist_ok=True)
-        
+
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         self.log_file = self.log_dir / f"session_{timestamp}.log"
-        
+
         self._cleanup_old_logs()
-        
+
         logging.basicConfig(
-            filename=str(self.log_file), 
-            level=logging.INFO, 
-            format='%(asctime)s - [%(levelname)s] - %(message)s', 
+            filename=str(self.log_file),
+            level=logging.INFO,
+            format='%(asctime)s - [%(levelname)s] - %(message)s',
             encoding='utf-8'
         )
         self.info(f"=== DEEPDRIVE {APP_VERSION} СЕССИЯ НАЧАТА ===")
@@ -101,18 +101,18 @@ class ForensicLogger:
         except Exception as e:
             pass
 
-    def info(self, msg: str): 
+    def info(self, msg: str):
         logging.info(msg)
 
-    def warn(self, msg: str): 
+    def warn(self, msg: str):
         logging.warning(msg)
 
-    def err(self, msg: str): 
+    def err(self, msg: str):
         logging.error(msg)
 
-    def hash_log(self, file_path: str, hash_val: str): 
+    def hash_log(self, file_path: str, hash_val: str):
         logging.info(f"ХЭШ ИНТЕГРИТИ: {file_path} -> SHA256: {hash_val}")
-    
+
     def read_logs_tail(self, lines_count=25) -> list:
         """Эффективное бинарное чтение логов с конца файла (не забивает ОЗУ)."""
         try:
@@ -122,47 +122,47 @@ class ForensicLogger:
                 lines = []
                 block_size = 1024
                 pos = f.tell()
-                
+
                 while pos > 0 and len(lines) <= lines_count:
                     read_size = min(block_size, pos)
                     pos -= read_size
                     f.seek(pos)
                     chunk = f.read(read_size)
                     buffer = bytearray(chunk) + buffer
-                    
+
                     if b'\n' in chunk:
                         lines = buffer.split(b'\n')
-                        
+
                 # Декодируем последние N строк
-                return [line.decode('utf-8', errors='replace').strip() 
+                return [line.decode('utf-8', errors='replace').strip()
                         for line in lines[-lines_count:] if line.strip()]
         except Exception as e:
             return [f"Ошибка чтения лога: {e}"]
-        
+
     def log_batch_result(self, hw_info: dict, total_size: int, write_speed: float, read_speed: float, corrupted_chunks: int, chunk_size: int):
         """Экспорт результатов тестирования партии флешек в Excel (CSV)."""
         if getattr(sys, 'frozen', False):
             base_dir = Path(sys.executable).parent
         else:
             base_dir = Path(os.path.abspath(__file__)).parent
-            
+
         csv_path = base_dir / "DEEPDRIVE_BATCH_REPORT.csv"
         file_exists = csv_path.exists()
-        
+
         try:
             with open(csv_path, mode='a', newline='', encoding='utf-8-sig') as f:
                 writer = csv.writer(f, delimiter=';')
 
                 if not file_exists:
                     writer.writerow([
-                        "Дата", "Время", "Метка ОС", "Контроллер (VID:PID)", "Серийный номер", 
-                        "Заявленный объем", "Потеряно (Фейк/Брак)", "Скорость Записи (МБ/с)", 
+                        "Дата", "Время", "Метка ОС", "Контроллер (VID:PID)", "Серийный номер",
+                        "Заявленный объем", "Потеряно (Фейк/Брак)", "Скорость Записи (МБ/с)",
                         "Скорость Чтения (МБ/с)", "ВЕРДИКТ"
                     ])
-                
+
                 lost_size = corrupted_chunks * chunk_size
                 status = "БРАК / ФЕЙК" if corrupted_chunks > 0 else "ОТЛИЧНО (ОРИГИНАЛ)"
-                
+
                 writer.writerow([
                     datetime.now().strftime("%Y-%m-%d"),
                     datetime.now().strftime("%H:%M:%S"),
@@ -209,20 +209,20 @@ class Win32DiskIO:
     FSCTL_UNLOCK_VOLUME = 0x0009001C
     FSCTL_DISMOUNT_VOLUME = 0x00090020
 
-    def __init__(self, drive_path: str, read_only=False):
+    def __init__(self, drive_path: str, read_only=False, force_write_blocker=False):
         self.path = drive_path
-        self.access = self.GENERIC_READ if read_only else (self.GENERIC_READ | self.GENERIC_WRITE)
+        self.access = self.GENERIC_READ if (read_only or force_write_blocker) else (self.GENERIC_READ | self.GENERIC_WRITE)
         self.handle = -1
         self.locked = False
 
     def __enter__(self):
         self.handle = ctypes.windll.kernel32.CreateFileW(
-            self.path, 
-            self.access, 
-            self.FILE_SHARE_READ | self.FILE_SHARE_WRITE, 
-            None, 
-            self.OPEN_EXISTING, 
-            0, 
+            self.path,
+            self.access,
+            self.FILE_SHARE_READ | self.FILE_SHARE_WRITE,
+            None,
+            self.OPEN_EXISTING,
+            0,
             None
         )
         if self.handle == -1:
@@ -257,40 +257,63 @@ class Win32DiskIO:
 # =====================================================================
 
 class HardwareManager:
+    @staticmethod
+    def get_system_drive_number() -> int:
+        if sys.platform != 'win32': return 0
+        windir = os.environ.get("WINDIR", "C:\\")
+        drive_letter = windir[:2] + "\\"
+        try:
+            import wmi
+            c = wmi.WMI()
+            for p in c.Win32_LogicalDiskToPartition():
+                if p.Dependent.DeviceID == windir[:2]:
+                    for d in c.Win32_DiskDriveToDiskPartition():
+                        if d.Dependent.DeviceID == p.Antecedent.DeviceID:
+                            match = re.search(r'PHYSICALDRIVE(\\d+)', d.Antecedent.DeviceID)
+                            if match: return int(match.group(1))
+        except Exception:
+            pass
+        return 0
+
+    @staticmethod
+    def is_system_drive(d_num: int) -> bool:
+        return d_num == HardwareManager.get_system_drive_number()
+
+
     """Отвечает за поиск, идентификацию и управление питанием USB-устройств."""
-    
+
     @staticmethod
     def is_valid_drive_letter(letter: str) -> bool:
         return bool(re.match(r"^[A-Z]:$", letter.upper()))
 
     @staticmethod
     def get_combined_usb_drives() -> list:
-        """
-        Протокол обнаружения: связывает физические устройства с логическими томами.
-        Позволяет видеть устройства даже с разрушенной файловой системой (RAW).
-        """
+        """Быстрый опрос WMI."""
         drives_list = []
-        ps_script = (
-            'Get-Disk | Where-Object { $_.BusType -eq "USB" } | ForEach-Object { '
-            '$d = $_; $letters = ($d | Get-Partition | Get-Volume).DriveLetter -join ", "; '
-            '[PSCustomObject]@{Number=$d.Number; Name=$d.FriendlyName; Size=$d.Size; Letters=$letters} '
-            '} | ConvertTo-Json'
-        )
         try:
-            out = subprocess.check_output(["powershell", "-NoProfile", "-Command", ps_script], text=True, stderr=subprocess.DEVNULL)
-            if out.strip():
-                data = json.loads(out)
-                if isinstance(data, dict): data = [data]
-                for d in data:
-                    is_raw = not bool(d['Letters'])
-                    label = f"{d['Letters']}:" if not is_raw else "RAW/UNINITIALIZED"
+            import wmi
+            c = wmi.WMI()
+            for disk in c.Win32_DiskDrive(InterfaceType="USB"):
+                letters = []
+                for dp in c.Win32_DiskDriveToDiskPartition():
+                    if dp.Antecedent.DeviceID == disk.DeviceID:
+                        for lp in c.Win32_LogicalDiskToPartition():
+                            if lp.Antecedent.DeviceID == dp.Dependent.DeviceID:
+                                letters.append(lp.Dependent.DeviceID)
+                is_raw = len(letters) == 0
+                label = ", ".join(letters) if letters else "RAW/UNINITIALIZED"
+
+                match = re.search(r'PHYSICALDRIVE(\\d+)', disk.DeviceID)
+                if match:
+                    d_num = int(match.group(1))
+                    size_val = int(disk.Size) if disk.Size else 0
                     drives_list.append({
-                        "num": d['Number'],
-                        "name": d['Name'],
-                        "size": int(d['Size']),
-                        "letter": d['Letters'].split(',')[0].strip() if d['Letters'] else None,
+                        "num": d_num,
+                        "name": disk.Model,
+                        "size": size_val,
+                        "letter": letters[0].replace(':', '') if letters else None,
                         "is_raw": is_raw,
-                        "display": f"[PHY_DRIVE_{d['Number']}] {label.ljust(18)} | {d['Name']} | {fmt_size(int(d['Size']))}"
+                        "display": f"[PHY_DRIVE_{d_num}] {label.ljust(18)} | {disk.Model} | {fmt_size(size_val)}"
                     })
         except Exception:
             pass
@@ -299,182 +322,54 @@ class HardwareManager:
     @staticmethod
     def get_hw_info(target: str) -> dict:
         info = {
-            'd_num': None, 'size': 0, 'vendor': 'Неизвестное устройство', 
-            'sn': 'Н/Д', 'vid': '0000', 'pid': '0000', 'PNP': None, 
+            'd_num': None, 'size': 0, 'vendor': 'Неизвестное устройство',
+            'sn': 'Н/Д', 'vid': '0000', 'pid': '0000', 'PNP': None,
             'ver': 'Н/Д', 'ro': False, 'bus': 'USB (Интерфейс не определен)'
         }
         if not target: return info
 
         try:
+            import wmi
+            c = wmi.WMI()
+
             d_num = -1
             if "Disk #" in target:
                 d_num = int(target.split('#')[1])
             else:
-                letter = target[0].upper()
-                ps_d_num = f"""
-                $assoc = Get-CimInstance Win32_LogicalDiskToPartition -ErrorAction SilentlyContinue | Where-Object {{ $_.Dependent.DeviceID -match '^{letter}' }};
-                if ($assoc -and $assoc.Antecedent.DeviceID -match 'Disk #(\\d+)') {{ $matches[1] }}
-                else {{ 
-                    $vol = Get-Partition -DriveLetter {letter} -ErrorAction SilentlyContinue | Get-Disk -ErrorAction SilentlyContinue;
-                    if ($vol) {{ $vol.Number }}
-                }}
-                """
-                out = subprocess.check_output(["powershell", "-NoProfile", "-Command", ps_d_num], text=True).strip()
-                if out and out.isdigit(): d_num = int(out)
+                letter = target[0].upper() + ":"
+                for p in c.Win32_LogicalDiskToPartition():
+                    if p.Dependent.DeviceID == letter:
+                        for d in c.Win32_DiskDriveToDiskPartition():
+                            if d.Dependent.DeviceID == p.Antecedent.DeviceID:
+                                match = re.search(r'PHYSICALDRIVE(\\d+)', d.Antecedent.DeviceID)
+                                if match: d_num = int(match.group(1))
 
             if d_num != -1:
-                # Полностью переписанный алгоритм: вместо Regex используется жесткий поиск по подстроке (-like)
-                ps_script = f"""
-                $dIdx = {d_num};
-                $drv = Get-CimInstance Win32_DiskDrive -Filter "Index=$dIdx" -ErrorAction SilentlyContinue;
-                $mD = Get-Disk -Number $dIdx -ErrorAction SilentlyContinue;
-                
-                if ($drv) {{
-                    $sn = $drv.SerialNumber;
-                    if (-not $sn) {{ $sn = '' }}
-                    
-                    # Очищаем серийник от маркеров Windows (например &0)
-                    $cleanSn = ($sn -replace '&[0-9]+$','') -replace '[^a-zA-Z0-9]','';
-                    
-                    $usbPnp = "";
-                    $usbDesc = "";
-                    $usbVer = 0;
-                    
-                    if ($cleanSn.Length -gt 3) {{
-                        # БРОНЕБОЙНЫЙ ПОИСК: ищем девайс, где есть VID, PID и очищенный серийник в любом месте пути
-                        $usb = Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue | Where-Object {{ $_.PNPDeviceID -like "*VID_*PID_*$cleanSn*" }} | Select-Object -First 1;
-                        
-                        if (-not $usb) {{
-                            # Резервный поиск
-                            $usb = Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue | Where-Object {{ $_.PNPDeviceID -like "*$cleanSn*" -and $_.PNPDeviceID -match "VID_" }} | Select-Object -First 1;
-                        }}
-                        
-                        if ($usb) {{
-                            $usbPnp = $usb.PNPDeviceID;
-                            $usbDesc = $usb.Description;
-                            $usbCim = Get-CimInstance -Namespace "root\\StandardCimv2" -ClassName MSFT_UsbDevice -ErrorAction SilentlyContinue | Where-Object {{ $_.PnpDeviceID -eq $usbPnp }} | Select-Object -First 1;
-                            if ($usbCim) {{ $usbVer = $usbCim.UsbVersion; }}
-                        }}
-                    }}
-                    
-                    @{{ 
-                        Mod=$drv.Model; 
-                        PNP=$usbPnp; 
-                        SN=$sn; 
-                        Num=$dIdx; 
-                        RO=if ($mD) {{ $mD.IsReadOnly }} else {{ $false }}; 
-                        Size=if ($mD) {{ $mD.Size }} else {{ 0 }}; 
-                        UsbVerCode=$usbVer;
-                        UsbDesc=$usbDesc;
-                        Rev=if ($mD -and $mD.FirmwareRevision) {{ $mD.FirmwareRevision }} else {{ "N/A" }};
-                    }} | ConvertTo-Json -Compress;
-                }}
-                """
-                
-                out = subprocess.check_output(["powershell", "-NoProfile", "-Command", ps_script], encoding='utf-8', errors='ignore').strip()
-                if out:
-                    data = json.loads(out)
-                    info['d_num'] = data.get('Num')
-                    info['size'] = int(data.get('Size') or 0)
-                    info['vendor'] = (data.get('Mod') or 'Неизвестное устройство').strip()
-                    
-                    raw_sn = str(data.get('SN') or '').strip()
-                    info['sn'] = 'Н/Д' if not raw_sn else raw_sn
-                    
-                    raw_rev = str(data.get('Rev') or '').strip()
-                    info['ver'] = 'Н/Д' if raw_rev in ('', 'N/A') else raw_rev
-                    
-                    info['ro'] = bool(data.get('RO'))
-                    pnp = data.get('PNP', '')
-                    desc = data.get('UsbDesc', '')
-                    info['PNP'] = pnp
+                for disk in c.Win32_DiskDrive(Index=d_num):
+                    info['d_num'] = d_num
+                    info['size'] = int(disk.Size) if disk.Size else 0
+                    info['vendor'] = disk.Model.strip() if disk.Model else 'Unknown Device'
+                    info['sn'] = disk.SerialNumber.strip() if disk.SerialNumber else 'N/A'
+                    info['ver'] = disk.FirmwareRevision.strip() if disk.FirmwareRevision else 'N/A'
+                    info['PNP'] = disk.PNPDeviceID
 
-                    # Парсинг найденного пути
-                    v_m = re.search(r'VID_([0-9A-F]{4})', pnp, re.I)
-                    p_m = re.search(r'PID_([0-9A-F]{4})', pnp, re.I)
-                    if v_m: info['vid'] = v_m.group(1).upper()
-                    if p_m: info['pid'] = p_m.group(1).upper()
+                    if disk.PNPDeviceID:
+                        v_m = re.search(r'VID_([0-9A-F]{4})', disk.PNPDeviceID, re.I)
+                        p_m = re.search(r'PID_([0-9A-F]{4})', disk.PNPDeviceID, re.I)
+                        if v_m: info['vid'] = v_m.group(1).upper()
+                        if p_m: info['pid'] = p_m.group(1).upper()
 
-                    # Определение поколения шины
-                    usb_ver_code = data.get('UsbVerCode', 0)
-                    if usb_ver_code > 0:
-                        hex_ver = f"{usb_ver_code:04X}"
-                        major, minor, sub = int(hex_ver[0:2]), int(hex_ver[2]), int(hex_ver[3])
-                        bus_str = f"USB {major}.{minor}"
-                        if sub > 0: bus_str += f".{sub}"
-                        
-                        if hex_ver == "0200": bus_str += " (Высокоскоростной)"
-                        elif hex_ver < "0200": bus_str += " (Устаревший интерфейс)"
-                        elif hex_ver == "0300": bus_str += " (SuperSpeed)"
-                        elif hex_ver == "0310": bus_str += " (SuperSpeed+ 10 Гбит/с)"
-                        elif hex_ver == "0320": bus_str += " (SuperSpeed+ 20 Гбит/с)"
-                        
-                        info['bus'] = bus_str
-                    else:
-                        if any(x in pnp+desc for x in ["3.0", "3.1", "3.2"]): info['bus'] = "USB 3.x (SuperSpeed)"
-                        elif "2.0" in pnp+desc: info['bus'] = "USB 2.0 (Высокоскоростной)"
-                        elif "1.1" in pnp+desc: info['bus'] = "USB 1.1 (Устаревший интерфейс)"
-                        elif v_m and p_m: info['bus'] = "USB 2.0 (Стандарт)"
-
-                # ── Доп. данные: SMART, разделы, занятость ──
-                if d_num != -1:
                     try:
-                        ps_extra = f"""
-                        $d = Get-Disk -Number {d_num} -ErrorAction SilentlyContinue;
-                        $rel = Get-StorageReliabilityCounter -Disk $d -ErrorAction SilentlyContinue;
-                        $parts = @(Get-Partition -DiskNumber {d_num} -ErrorAction SilentlyContinue);
-                        $used = [long]0;
-                        $firstFs = '';
-                        foreach ($p in $parts) {{
-                            $vol = Get-Volume -Partition $p -ErrorAction SilentlyContinue;
-                            if ($vol) {{
-                                if (-not $firstFs -and $vol.FileSystemType) {{ $firstFs = $vol.FileSystemType; }}
-                                if ($vol.Size -ne $null -and $vol.SizeRemaining -ne $null) {{
-                                    $used += ([long]$vol.Size - [long]$vol.SizeRemaining);
-                                }}
-                            }}
-                        }}
-                        @{{
-                            SmartTemp   = if ($rel) {{ $rel.Temperature }} else {{ $null }};
-                            SmartSt     = if ($d) {{ $d.HealthStatus }} else {{ 'Unknown' }};
-                            PartStyle   = if ($d) {{ $d.PartitionStyle }} else {{ 'RAW' }};
-                            PartCount   = $parts.Count;
-                            UsedBytes   = $used;
-                            ReadErrors  = if ($rel) {{ $rel.ReadErrorsTotal }} else {{ $null }};
-                            WriteErrors = if ($rel) {{ $rel.WriteErrorsTotal }} else {{ $null }};
-                            PowerOnHrs  = if ($rel) {{ $rel.PowerOnHours }} else {{ $null }};
-                            Wear        = if ($rel) {{ $rel.Wear }} else {{ $null }};
-                            MediaType   = if ($d) {{ $d.MediaType }} else {{ 'Unknown' }};
-                            OpStatus    = if ($d) {{ $d.OperationalStatus }} else {{ 'Unknown' }};
-                            FsType      = $firstFs;
-                        }} | ConvertTo-Json -Compress
-                        """
-                        out2 = subprocess.check_output(
-                            ["powershell", "-NoProfile", "-Command", ps_extra],
-                            encoding='utf-8', errors='ignore', timeout=10
-                        ).strip()
-                        if out2:
-                            ex = json.loads(out2)
-                            info['smart_temp']    = ex.get('SmartTemp')
-                            info['smart_health']  = str(ex.get('SmartSt', 'Unknown'))
-                            info['part_style']    = str(ex.get('PartStyle', 'RAW')).upper()
-                            info['part_count']    = int(ex.get('PartCount', 0))
-                            info['used_bytes']    = int(ex.get('UsedBytes', 0))
-                            info['read_errors']   = ex.get('ReadErrors')
-                            info['write_errors']  = ex.get('WriteErrors')
-                            info['power_on_hrs']  = ex.get('PowerOnHrs')
-                            info['wear']          = ex.get('Wear')
-                            info['media_type']    = str(ex.get('MediaType', 'Unknown'))
-                            info['op_status']     = str(ex.get('OpStatus', 'Unknown'))
-                            info['fs_type']       = str(ex.get('FsType', ''))
+                        c2 = wmi.WMI(namespace="root\\Microsoft\\Windows\\Storage")
+                        for m_disk in c2.MSFT_PhysicalDisk(DeviceId=str(d_num)):
+                            info['ro'] = m_disk.IsReadOnly
                     except Exception:
                         pass
-
         except Exception:
             pass
 
         return info
-    
+
     def get_safe_path(self, target: str) -> str:
         """Превращает 'Disk #2' или 'F:' в корректный путь для Windows API."""
         if not target: return ""
@@ -522,7 +417,7 @@ class LocalDB:
                     self.logger.err(f"Ошибка загрузки БД: {e}")
                     _log_status("[-] Ошибка загрузки базы.", "err")
                     time.sleep(1)
-                
+
         if os.path.exists(self.db_file):
             _log_status("[*] Индексация базы оборудования...", "info")
             try:
@@ -644,7 +539,7 @@ class Settings:
 
     # Ключи, которые принадлежат отдельным группам (не DEFAULTS)
     _META_FIELDS    = {"_meta", "_menu_labels", "_hotkeys", "_disabled_items"}
-    
+
     # Ключи по типу пресета
     PRESET_KEYS = {
         "theme": [
@@ -775,11 +670,11 @@ class Settings:
             raw = json.loads(file_path.read_text(encoding='utf-8'))
         except Exception as e:
             return False, {}, [f"Ошибка чтения JSON: {e}"]
-        
+
         meta = raw.get('_meta', {})
         warnings = []
         applied = 0
-        
+
         for k, v in raw.items():
             if k in self._META_FIELDS:
                 continue  # обрабатываем отдельно
@@ -788,7 +683,7 @@ class Settings:
                 applied += 1
             else:
                 warnings.append(f"Неизвестный ключ '{k}' — пропущен")
-        
+
         # Применяем мета-поля
         if '_menu_labels' in raw:
             self.menu_labels = raw['_menu_labels']
@@ -796,7 +691,7 @@ class Settings:
             self.hotkeys = raw['_hotkeys']
         if '_disabled_items' in raw:
             self.disabled_items = raw['_disabled_items']
-        
+
         self.save()
         return True, meta, warnings
 
@@ -856,107 +751,6 @@ class Settings:
         return False
 
 
-    def _get_presets_path(self):
-        # Папка "Пресеты" рядом со скриптом
-        try:
-            base_path = Path(sys.argv[0]).resolve().parent
-        except:
-            base_path = Path('.').resolve()
-        path = base_path / 'Пресеты'
-        if not path.exists():
-            try: path.mkdir(parents=True, exist_ok=True)
-            except: pass
-        return path
-
-    def _get_presets_list(self):
-        path = self._get_presets_path()
-        return [f.stem for f in path.glob('*.json')]
-
-    def save_preset(self, name):
-        path = self._get_presets_path() / f"{name}.json"
-        try:
-            path.write_text(json.dumps(self.data, indent=2, ensure_ascii=False), encoding='utf-8')
-            return True
-        except: return False
-
-    def load_preset(self, name):
-        path = self._get_presets_path() / f"{name}.json"
-        if path.exists():
-            try:
-                loaded = json.loads(path.read_text(encoding='utf-8'))
-                self.data.update(loaded)
-                self.save()
-                return True
-            except: return False
-        return False
-
-    def delete_preset(self, name):
-        path = self._get_presets_path() / f"{name}.json"
-        if path.exists():
-            try: path.unlink(); return True
-            except: return False
-        return False
-
-    def get_preset_data(self, name):
-        path = self._get_presets_path() / f"{name}.json"
-        if path.exists():
-            try: return json.loads(path.read_text(encoding='utf-8'))
-            except: return None
-        return None
-
-    def accent_ansi(self) -> str:
-        r, g, b = self.get('accent_r'), self.get('accent_g'), self.get('accent_b')
-        return f"\033[1;38;2;{r};{g};{b}m"
-
-
-    def _get_presets_path(self):
-        # Папка "Пресеты" рядом со скриптом
-        try:
-            base_path = Path(sys.argv[0]).resolve().parent
-        except:
-            base_path = Path('.').resolve()
-        path = base_path / 'Пресеты'
-        if not path.exists():
-            try: path.mkdir(parents=True, exist_ok=True)
-            except: pass
-        return path
-
-    def _get_presets_list(self):
-        path = self._get_presets_path()
-        return [f.stem for f in path.glob('*.json')]
-
-    def save_preset(self, name):
-        path = self._get_presets_path() / f"{name}.json"
-        try:
-            path.write_text(json.dumps(self.data, indent=2, ensure_ascii=False), encoding='utf-8')
-            return True
-        except: return False
-
-    def load_preset(self, name):
-        path = self._get_presets_path() / f"{name}.json"
-        if path.exists():
-            try:
-                loaded = json.loads(path.read_text(encoding='utf-8'))
-                self.data.update(loaded)
-                self.save()
-                return True
-            except: return False
-        return False
-
-    def delete_preset(self, name):
-        path = self._get_presets_path() / f"{name}.json"
-        if path.exists():
-            try: path.unlink(); return True
-            except: return False
-        return False
-
-    def get_preset_data(self, name):
-        path = self._get_presets_path() / f"{name}.json"
-        if path.exists():
-            try: return json.loads(path.read_text(encoding='utf-8'))
-            except: return None
-        return None
-
     def accent_ansi_normal(self) -> str:
         r, g, b = self.get('accent_r'), self.get('accent_g'), self.get('accent_b')
         return f"\033[38;2;{r};{g};{b}m"
@@ -979,7 +773,7 @@ class BiosTheme:
         s = self.settings
         def _rgb(r,g,b): return f"\033[38;2;{r};{g};{b}m"
         def _bg(r,g,b):  return f"\033[48;2;{r};{g};{b}m"
-        
+
         ar, ag, ab = s.get('accent_r'), s.get('accent_g'), s.get('accent_b')
         br, bg, bb = s.get('bg_r'), s.get('bg_g'), s.get('bg_b')
         tr, tg, tb = s.get('text_r'), s.get('text_g'), s.get('text_b')
@@ -1078,7 +872,9 @@ class BiosTheme:
         print(sep + "\n")
 
     def run_task(self, title: str, worker_func, danger_level=0, *args):
-        """Запустить задачу в фоновом потоке с отображением статуса и ESC-отменой."""
+        """Запустить задачу в пуле потоков с отображением статуса и ESC-отменой."""
+        import concurrent.futures
+
         self.slow_print(f"  ▸  {title}...\n", "info")
 
         if danger_level == 2:
@@ -1090,21 +886,21 @@ class BiosTheme:
         print(self.c("  ·  ESC — экстренная отмена.\n", "dim"))
 
         ctx = TaskContext()
-        worker_thread = threading.Thread(target=worker_func, args=(ctx, *args), daemon=True)
-        worker_thread.start()
 
-        try:
-            while worker_thread.is_alive():
-                if msvcrt.kbhit() and msvcrt.getch() == b'\x1b':
-                    ctx.cancel = True
-                status_text = ctx.get_status()
-                sys.stdout.write(f"\r  │ {status_text}".ljust(90))
-                sys.stdout.flush()
-                time.sleep(0.05)
-            worker_thread.join()
-        except KeyboardInterrupt:
-            ctx.cancel = True
-            worker_thread.join()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(worker_func, ctx, *args)
+            try:
+                while not future.done():
+                    if msvcrt.kbhit() and msvcrt.getch() == b'\x1b':
+                        ctx.cancel = True
+                    status_text = ctx.get_status()
+                    sys.stdout.write(f"\r  │ {status_text}".ljust(90))
+                    sys.stdout.flush()
+                    time.sleep(0.05)
+            except KeyboardInterrupt:
+                ctx.cancel = True
+
+            future.result()
 
         sys.stdout.write(f"\r  │ {ctx.get_status()}".ljust(90) + "\n")
 
@@ -1253,7 +1049,7 @@ class HexViewer:
 def protective_shell(func):
     """Декоратор для перехвата системных сбоев (возвращен из V1.6)."""
     def wrapper(self, *args, **kwargs):
-        try: 
+        try:
             return func(self, *args, **kwargs)
         except PermissionError:
             print(self.ui.c("\n  [-] СИСТЕМНАЯ БЛОКИРОВКА: Необходимы права Администратора.", "err"))
@@ -1271,19 +1067,19 @@ class CoreEngine:
         self.ui = ui
         self.logger = logger
         self.db = db
-        self.write_block = True 
-        
+        self.write_block = True
+
         # Расширенный словарь сигнатур (из V1.6 + добавлены новые)
         self.signatures = [
-            (b'\xFF\xD8\xFF', b'\xFF\xD9', "jpg"), 
+            (b'\xFF\xD8\xFF', b'\xFF\xD9', "jpg"),
             (b'\x89\x50\x4E\x47\x0D\x0A\x1A\x0A', b'\x49\x45\x4E\x44\xAE\x42\x60\x82', "png"),
-            (b'%PDF-', b'%%EOF', "pdf"), 
+            (b'%PDF-', b'%%EOF', "pdf"),
             (b'\x50\x4B\x03\x04', b'\x50\x4B\x05\x06', "zip_docx_xlsx"),
             (b'\x52\x61\x72\x21\x1A\x07\x00', b'\xC4\x3D\x7B\x00\x40\x07\x00', "rar"),
             (b'\x37\x7A\xBC\xAF\x27\x1C', None, "7z"),
-            (b'\x49\x44\x33', None, "mp3"), 
+            (b'\x49\x44\x33', None, "mp3"),
             (b'\x00\x00\x00\x18\x66\x74\x79\x70', None, "mp4"),
-            (b'\x52\x49\x46\x46', b'\x41\x56\x49\x20', "avi"), 
+            (b'\x52\x49\x46\x46', b'\x41\x56\x49\x20', "avi"),
             (b'\x4D\x5A', None, "exe_dll"),
             (b'\x53\x51\x4C\x69\x74\x65\x20\x66\x6F\x72\x6D\x61\x74\x20\x33\x00', None, "sqlite"),
             (b'\x4F\x67\x67\x53', None, "ogg"),
@@ -1714,93 +1510,125 @@ class CoreEngine:
 
     @protective_shell
     def export_hw_report(self, hw: dict, v_db: str, p_db: str) -> str:
-        """Сохраняет аппаратную сводку в TXT-файл рядом с программой."""
+        """Экспорт красивого HTML отчета."""
         if getattr(sys, 'frozen', False):
             base_dir = Path(sys.executable).parent
         else:
             base_dir = Path(os.path.abspath(__file__)).parent
 
         sn = hw.get('sn', 'ND') or 'ND'
-        sn_safe = re.sub(r'[^\w]', '_', sn)
+        import re
+        sn_safe = re.sub(r'[^\\w]', '_', sn)
         ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-        out_path = base_dir / f"DD_HW_REPORT_{sn_safe}_{ts}.txt"
+        out_path = base_dir / f"DD_REPORT_{sn_safe}_{ts}.html"
 
-        lines = [
-            f"DEEPDRIVE {APP_VERSION} — Аппаратная сводка",
-            f"Дата: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            "=" * 60,
-            f"ID устройства  : PhysicalDrive{hw.get('d_num', 'N/A')}",
-            f"Имя в ОС       : {hw.get('vendor', 'N/A')}",
-            f"Физ. размер    : {fmt_size(hw.get('size', 0))}",
-            f"Шина данных    : {hw.get('bus', 'N/A')}",
-            f"Серийный номер : {sn}",
-            f"Прошивка (REV) : {hw.get('ver', 'N/A')}",
-            f"Режим записи   : {'ЗАБЛОКИРОВАН' if hw.get('ro') else 'ОТКРЫТ'}",
-            "-" * 60,
-            f"VENDOR ID (VID): 0x{str(hw.get('vid','0000')).zfill(4)} → {v_db}",
-            f"PRODUCT ID PID): 0x{str(hw.get('pid','0000')).zfill(4)} → {p_db}",
-            f"PNP ID         : {hw.get('PNP', 'N/A')}",
-            "=" * 60,
-        ]
+        try:
+            from jinja2 import Template
+        except ImportError:
+            Template = None
+
+        if Template:
+            template_str = """
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+                <meta charset="UTF-8">
+                <title>DeepDrive Hardware Report - {{ sn }}</title>
+                <style>
+                    body { font-family: "Courier New", Courier, monospace; background-color: #050508; color: #d2d2d2; padding: 20px; }
+                    .container { max-width: 800px; margin: 0 auto; border: 1px solid #333; padding: 20px; box-shadow: 0 0 10px rgba(36, 228, 213, 0.2); }
+                    h1 { color: #24e4d5; border-bottom: 1px solid #333; padding-bottom: 10px; }
+                    h2 { color: #888; }
+                    table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+                    th, td { padding: 10px; text-align: left; border-bottom: 1px solid #222; }
+                    th { color: #24e4d5; }
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <h1>DEEPDRIVE V2.2 - HARDWARE REPORT</h1>
+                    <p><strong>Generated:</strong> {{ ts }}</p>
+                    <p><strong>Device ID:</strong> PhysicalDrive{{ hw.get('d_num', 'N/A') }}</p>
+                    <h2>Identification</h2>
+                    <table>
+                        <tr><th>OS Name</th><td>{{ hw.get('vendor', 'N/A') }}</td></tr>
+                        <tr><th>Size</th><td>{{ hw.get('size', 0) }} Bytes</td></tr>
+                        <tr><th>Bus</th><td>{{ hw.get('bus', 'N/A') }}</td></tr>
+                        <tr><th>Serial Number</th><td style="color:#ffc800">{{ sn }}</td></tr>
+                        <tr><th>Firmware</th><td>{{ hw.get('ver', 'N/A') }}</td></tr>
+                    </table>
+                    <h2>Controller Data</h2>
+                    <table>
+                        <tr><th>Vendor ID</th><td style="color:#50e678">{{ hw.get('vid','0000') }} - {{ v_db }}</td></tr>
+                        <tr><th>Product ID</th><td style="color:#50e678">{{ hw.get('pid','0000') }} - {{ p_db }}</td></tr>
+                        <tr><th>PNP ID</th><td>{{ hw.get('PNP', 'N/A') }}</td></tr>
+                    </table>
+                </div>
+            </body>
+            </html>
+            """
+            t = Template(template_str)
+            html = t.render(hw=hw, v_db=v_db, p_db=p_db, sn=sn, ts=ts)
+        else:
+            # Fallback string formatting
+            html = f"<html><body><h1>DeepDrive Report</h1><p>SN: {sn}</p><p>Vendor: {hw.get('vendor', 'N/A')}</p></body></html>"
 
         with open(out_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines) + "\n")
+            f.write(html)
 
-        self.logger.info(f"Сводка экспортирована: {out_path}")
+        self.logger.info(f"HTML Report exported: {out_path}")
         return str(out_path)
 
-
-    @protective_shell
     def parse_mbr(self, d_num: int):
         """Детальный парсинг загрузочных секторов MBR и таблиц GPT."""
         path = f"\\\\.\\PhysicalDrive{d_num}"
         self.logger.info(f"Парсинг MBR/GPT для {path}")
-        
-        with open(path, 'rb') as disk_file: 
+
+        with open(path, 'rb') as disk_file:
             data = disk_file.read(512)
-            
+
         if data[510:512] != b'\x55\xAA':
             print(self.ui.c("  [-] ОШИБКА: Недействительная сигнатура MBR (отсутствует 55 AA).", "err"))
             return
-            
+
         partition_table = data[446:510]
         fs_types = {
-            0x07: "NTFS/exFAT", 0x0B: "FAT32", 0x0C: "FAT32 (LBA)", 
+            0x07: "NTFS/exFAT", 0x0B: "FAT32", 0x0C: "FAT32 (LBA)",
             0x83: "Linux ext", 0xEE: "GPT Защитный", 0x0F: "Extended LBA"
         }
-        
+
         # Проверка на наличие GPT (тип раздела 0xEE)
         is_gpt = False
         for i in range(4):
             if partition_table[i*16 + 4] == 0xEE:
                 is_gpt = True
                 break
-                
+
         if is_gpt:
             print(self.ui.c("\n  [+] Обнаружен GPT (GUID Partition Table). Чтение заголовка...", "ok"))
-            
+
             with open(path, 'rb') as disk_file:
                 disk_file.seek(512)
                 gpt_hdr = disk_file.read(512)
-                
+
             if gpt_hdr[:8] == b'EFI PART':
                 ent_lba = struct.unpack("<Q", gpt_hdr[72:80])[0]
                 num_ent = struct.unpack("<I", gpt_hdr[80:84])[0]
                 ent_sz = struct.unpack("<I", gpt_hdr[84:88])[0]
-                
+
                 with open(path, 'rb') as disk_file:
                     disk_file.seek(ent_lba * 512)
-                    
+
                     for i in range(min(num_ent, 128)): # Читаем максимум 128 разделов
                         entry = disk_file.read(ent_sz)
-                        if entry[:16] == b'\x00'*16: 
+                        if entry[:16] == b'\x00'*16:
                             continue # Пустой слот
-                            
+
                         start_lba = struct.unpack("<Q", entry[32:40])[0]
                         end_lba = struct.unpack("<Q", entry[40:48])[0]
                         name = entry[56:128].decode('utf-16le').rstrip('\x00')
                         size_mb = ((end_lba - start_lba + 1) * 512) / (1024 * 1024)
-                        
+
                         print(self.ui.c(f"  GPT РАЗДЕЛ {i+1}:", "highlight"))
                         print(f"    ├─ Имя        : {name or 'БЕЗ ИМЕНИ'}")
                         print(f"    ├─ Старт LBA  : {start_lba}")
@@ -1810,17 +1638,17 @@ class CoreEngine:
             for i in range(4):
                 entry = partition_table[i*16:(i+1)*16]
                 part_type = entry[4]
-                
-                if part_type == 0: 
+
+                if part_type == 0:
                     continue # Пустой раздел
-                    
+
                 status = "Активный/Boot" if entry[0] == 0x80 else "Неактивный"
                 fs_desc = fs_types.get(part_type, f"Неизвестно (0x{part_type:02X})")
-                
+
                 lba_start = struct.unpack("<I", entry[8:12])[0]
                 lba_size = struct.unpack("<I", entry[12:16])[0]
                 size_mb = (lba_size * 512) / (1024 * 1024)
-                
+
                 print(self.ui.c(f"  MBR РАЗДЕЛ {i+1}:", "highlight"))
                 print(f"    ├─ Статус     : {status}")
                 print(f"    ├─ Тип ФС     : {fs_desc}")
@@ -1832,22 +1660,22 @@ class CoreEngine:
         """Сканирует диск на предмет зашифрованных контейнеров через энтропию Шеннона."""
         path = f"\\\\.\\PhysicalDrive{d_num}"
         self.ui.slow_print("  [*] Расчет математической энтропии по случайной выборке...", "info")
-        
+
         with open(path, 'rb') as f:
             # Прыгаем в середину диска (там обычно данные)
             f.seek(max(0, size // 2))
             sample = f.read(1024 * 1024 * 10) # Выборка 10 МБ
-            
+
             counts = collections.Counter(sample)
             entropy = -sum((c/len(sample)) * math.log2(c/len(sample)) for c in counts.values() if c > 0)
-            
+
             print(f"\n  │ Уровень энтропии: {self.ui.c(f'{entropy:.4f} / 8.0000', 'warn')}")
-            
-            if entropy > 7.99: 
+
+            if entropy > 7.99:
                 print(self.ui.c("  │ ВЕРДИКТ: Данные зашифрованы (BitLocker, VeraCrypt) или это архив.", "err"))
-            elif entropy < 2.0: 
+            elif entropy < 2.0:
                 print(self.ui.c("  │ ВЕРДИКТ: Пустая область или нули. Шифрование отсутствует.", "ok"))
-            else: 
+            else:
                 print(self.ui.c("  │ ВЕРДИКТ: Стандартные данные. Признаков крипто-контейнера нет.", "ok"))
 
     # --- ИНСТРУМЕНТЫ АДМИНИСТРИРОВАНИЯ (RUFUS) ---
@@ -1855,26 +1683,26 @@ class CoreEngine:
     @protective_shell
     def partition_manager(self, d_num: int):
         """Обертка над Diskpart для создания новых разделов."""
-        if self.write_block: 
+        if self.write_block:
             return print(self.ui.c("  [-] ОТКЛОНЕНО: Включен программный Write-Blocker!", "err"))
-            
+
         print("  1 - FAT32 (Совместимость)\n  2 - exFAT (Для больших файлов)\n  3 - NTFS (Для Windows)\n  0 - Отмена")
         choice = input(self.ui.c("\n  Выберите файловую систему >> ", "highlight"))
-        
+
         fs_map = {"1": "fat32", "2": "exfat", "3": "ntfs"}
-        if choice not in fs_map: 
+        if choice not in fs_map:
             return
-            
+
         confirm = input(self.ui.c("  Введите 'FORMAT' для уничтожения текущих разделов >> ", "warn"))
-        if confirm != "FORMAT": 
+        if confirm != "FORMAT":
             return
-        
+
         target_fs = fs_map[choice]
         self.logger.info(f"Форматирование диска {d_num} в {target_fs}")
         self.ui.slow_print("  [*] Выполнение командного сценария Diskpart...", "info")
-        
+
         diskpart_script = f"select disk {d_num}\nclean\ncreate partition primary\nformat fs={target_fs} quick\nassign\nexit\n"
-        
+
         subprocess.run(["diskpart"], input=diskpart_script.encode('utf-8'), stdout=subprocess.DEVNULL)
         self.ui.slow_print("  [+] Раздел успешно создан, отформатирован и смонтирован.", "ok")
 
@@ -1882,13 +1710,13 @@ class CoreEngine:
         """Асинхронная блокировка/разблокировка с проверкой аппаратного тумблера."""
         try:
             ctx.update(f"Применение защиты уровня ОС: {'ВКЛ' if lock else 'ВЫКЛ'}...")
-            
+
             if not lock:
                 dp_script = f"select disk {d_num}\nattributes disk clear readonly\nexit\n"
                 subprocess.run(["diskpart"], input=dp_script.encode('utf-8'), stdout=subprocess.DEVNULL)
                 reg_cmd = 'reg add "HKLM\\System\\CurrentControlSet\\Control\\StorageDevicePolicies" /v WriteProtect /t REG_DWORD /d 0 /f'
                 subprocess.run(reg_cmd, shell=True, stdout=subprocess.DEVNULL)
-                
+
             ps_cmd = f"Set-Disk -Number {d_num} -IsReadOnly {'$true' if lock else '$false'}"
             subprocess.run(["powershell", "-Command", ps_cmd], capture_output=True)
 
@@ -1927,7 +1755,14 @@ class CoreEngine:
     # --- ФОНОВЫЕ ВОРКЕРЫ (FORENSICS & RECOVERY) ---
 
     def carver_worker(self, ctx: TaskContext, letter: str):
-        """File Carver - Поиск и извлечение файлов по их RAW-сигнатурам."""
+        """Fast Carver - Поиск и извлечение файлов по их RAW-сигнатурам с Aho-Corasick."""
+        import mmap
+        try:
+            import ahocorasick
+            HAS_AHOCORASICK = True
+        except ImportError:
+            HAS_AHOCORASICK = False
+
         path = f"\\\\.\\{letter}"
 
         if getattr(sys, 'frozen', False):
@@ -1937,123 +1772,89 @@ class CoreEngine:
 
         out_dir = base_dir / f"Recovered_Files_{int(time.time())}"
         out_dir.mkdir(exist_ok=True)
-        
+
         found_counts = {ext: 0 for _, _, ext in self.signatures}
-        for ext in found_counts.keys(): 
+        for ext in found_counts.keys():
             (out_dir / ext).mkdir(exist_ok=True)
 
-        chunk_size = 1024 * 1024 * 16 # Читаем по 16 МБ
-        overlap_size = 1024 * 1024    # Перекрытие 1 МБ на стыке чанков
-        
+        if HAS_AHOCORASICK:
+            automaton = ahocorasick.Automaton()
+            for i, (sig_start, sig_end, ext) in enumerate(self.signatures):
+                automaton.add_word(sig_start, (i, sig_start, sig_end, ext))
+            automaton.make_automaton()
+
         try:
-            with open(path, "rb") as disk:
-                prev_chunk = b''
-                scanned_bytes = 0
-                
-                while not ctx.cancel:
-                    raw_data = disk.read(chunk_size)
-                    if not raw_data: 
-                        break
-                        
-                    buffer = prev_chunk + raw_data
-                    
-                    for sig_start, sig_end, ext in self.signatures:
-                        idx = 0
-                        while True:
-                            idx = buffer.find(sig_start, idx)
-                            if idx == -1 or idx > len(buffer) - len(sig_start): 
-                                break
-                            
-                            end_idx = -1
+            fd = os.open(path, os.O_RDONLY | os.O_BINARY)
+            try:
+                with mmap.mmap(fd, 0, access=mmap.ACCESS_READ) as mm:
+                    total_size = mm.size()
+                    if HAS_AHOCORASICK:
+                        for end_idx, (idx, sig_start, sig_end, ext) in automaton.iter(mm):
+                            if ctx.cancel: break
+                            start_idx = end_idx - len(sig_start) + 1
+
+                            file_end_idx = -1
                             if sig_end:
-                                end_idx = buffer.find(sig_end, idx + len(sig_start))
-                            
-                            if end_idx != -1:
-                                data = buffer[idx:end_idx + len(sig_end)]
-                            elif ext == "exe_dll":
-                                try:
-                                    pe_data = buffer[idx:]
-                                    if len(pe_data) > 64:
+                                file_end_idx = mm.find(sig_end, start_idx + len(sig_start))
+                            # Prevent MemoryError by enforcing a maximum file carve size
+                            max_carve_size = 64 * 1024 * 1024
+                            if file_end_idx != -1 and (file_end_idx - start_idx) > max_carve_size:
+                                file_end_idx = -1
 
-                                        e_lfanew = struct.unpack("<I", pe_data[60:64])[0]
-                                        if e_lfanew + 24 < len(pe_data) and pe_data[e_lfanew:e_lfanew+4] == b'PE\x00\x00':
-                                            num_sections = struct.unpack("<H", pe_data[e_lfanew+6:e_lfanew+8])[0]
-                                            opt_hdr_size = struct.unpack("<H", pe_data[e_lfanew+20:e_lfanew+22])[0]
-
-                                            sections_offset = e_lfanew + 24 + opt_hdr_size
-                                            max_ptr = 0
-                                            for s in range(num_sections):
-                                                s_off = sections_offset + (s * 40)
-                                                if s_off + 40 > len(pe_data): 
-                                                    break
-                                                raw_size = struct.unpack("<I", pe_data[s_off+16:s_off+20])[0]
-                                                raw_ptr = struct.unpack("<I", pe_data[s_off+20:s_off+24])[0]
-                                                if raw_ptr + raw_size > max_ptr:
-                                                    max_ptr = raw_ptr + raw_size
-
-                                            if 0 < max_ptr <= len(pe_data):
-                                                data = buffer[idx:idx + max_ptr]
-                                            else:
-                                                data = buffer[idx:idx + 1024*1024*10] 
-                                        else:
-                                            data = buffer[idx:idx + 1024*1024*2]
-                                    else:
-                                        data = buffer[idx:idx + 1024*1024*2]
-                                except Exception:
-                                    data = buffer[idx:idx + 1024*1024*2]
+                            if file_end_idx == -1:
+                                file_end_idx = min(start_idx + 1024*1024*2, total_size)
                             else:
-                                data = buffer[idx:idx + 1024*1024*2]
-                            
-                            
+                                file_end_idx += len(sig_end)
+
+                            data = mm[start_idx:file_end_idx]
+
                             is_valid = True
-                            if ext == "jpg" and (len(data) < 4 or data[-2:] != b'\xFF\xD9'): 
+                            if ext == "jpg" and (len(data) < 4 or data[-2:] != b'\xFF\xD9'):
                                 is_valid = False
-                                
+
                             if is_valid and len(data) > min(len(sig_start)*2, 16):
                                 found_counts[ext] += 1
                                 file_path = out_dir / ext / f"recovered_{found_counts[ext]}.{ext}"
                                 file_path.write_bytes(data)
-                            
-                            idx += len(sig_start)
-                    
-                    scanned_bytes += len(raw_data)
-                    prev_chunk = raw_data[-overlap_size:] if len(raw_data) >= overlap_size else raw_data
-                    
-                    total_found = sum(found_counts.values())
-                    # V2.2: прогресс вычисляем через побайтовую позицию внутри диска
-                    bar = self.ui.progress_bar(min(99.9, (scanned_bytes % (1024*1024*1024)) / (1024*1024*10)))
-                    ctx.update(f"Скан: {fmt_size(scanned_bytes)} {bar}  Найдено: {total_found} ф.")
-            
+
+                            if sum(found_counts.values()) % 10 == 0:
+                                percent = (end_idx / total_size) * 100
+                                bar = self.ui.progress_bar(percent)
+                                ctx.update(f"Скан (Aho-Corasick): {percent:.1f}% {bar} Найдено: {sum(found_counts.values())} ф.")
+                    else:
+                        ctx.error = "Библиотека pyahocorasick не установлена."
+                        return
+            finally:
+                os.close(fd)
             if not ctx.cancel:
                 ctx.result = f"Восстановлено {sum(found_counts.values())} файлов. Папка: {out_dir.absolute()}"
         except Exception as e:
             self.logger.err(traceback.format_exc())
             ctx.error = str(e)
 
-
     def undelete_worker(self, ctx: TaskContext, letter: str):
         """Сложный сканер удаленных файлов в файловых системах NTFS, FAT32 и exFAT."""
         path = f"\\\\.\\{letter}"
-        
+
         try:
             with open(path, "rb") as disk:
                 # Читаем Volume Boot Record (VBR)
                 vbr = disk.read(512)
                 found_files = 0
-                
+
                 # Анализ NTFS
                 if vbr[3:7] == b'NTFS':
                     bytes_per_sector = struct.unpack("<H", vbr[11:13])[0]
                     sectors_per_cluster = vbr[13]
                     mft_lcn = struct.unpack("<Q", vbr[48:56])[0]
-                    
+
                     disk.seek(mft_lcn * bytes_per_sector * sectors_per_cluster)
-                    
+
                     for _ in range(150000):
                         if ctx.cancel: break
                         record = bytearray(disk.read(1024))
                         if len(record) < 1024: break
-                            
+
                         if record[:4] == b"FILE":
                             usa_off = struct.unpack("<H", record[4:6])[0]
                             usa_cnt = struct.unpack("<H", record[6:8])[0]
@@ -2072,7 +1873,7 @@ class CoreEngine:
                                     attr_type = struct.unpack("<I", record[attr_pos:attr_pos+4])[0]
                                     if attr_type == 0xFFFFFFFF: break
                                     attr_len = struct.unpack("<I", record[attr_pos+4:attr_pos+8])[0]
-                                    
+
                                     if attr_type == 0x30 and attr_len > 0 and attr_pos + attr_len <= 1024:
                                         if record[attr_pos+8] == 0:
                                             val_off = struct.unpack("<H", record[attr_pos+20:attr_pos+22])[0]
@@ -2087,10 +1888,10 @@ class CoreEngine:
                                         break
                                     if attr_len == 0: break
                                     attr_pos += attr_len
-                                    
+
                         if found_files % 10 == 0:
                             ctx.update(f"[NTFS] Анализ таблиц $MFT... Найдено: {found_files}")
-                            
+
                 # Анализ FAT32
                 elif vbr[82:90] == b'FAT32   ':
                     disk.seek(0)
@@ -2099,7 +1900,7 @@ class CoreEngine:
                         if ctx.cancel: break
                         raw_data = disk.read(1024 * 1024 * 16)
                         if not raw_data: break
-                            
+
                         buffer = prev_chunk + raw_data
                         idx = 0
                         while True:
@@ -2114,7 +1915,7 @@ class CoreEngine:
                                     self.logger.info(f"FAT32 УДАЛЕНО: {name}")
                                     found_files += 1
                             idx += 32
-                            
+
                         prev_chunk = raw_data[-32:] if len(raw_data) >= 32 else raw_data
                         ctx.update(f"[FAT32] Поиск маркеров 0xE5... Найдено: {found_files}")
 
@@ -2122,25 +1923,25 @@ class CoreEngine:
                 elif vbr[3:11] == b'EXFAT   ':
                     bytes_per_sector = 1 << vbr[108] # Смещение 108: BytesPerSectorShift
                     cluster_heap_offset = struct.unpack("<I", vbr[88:92])[0]
-                    
+
                     # Прыгаем в область данных (Cluster Heap)
                     disk.seek(cluster_heap_offset * bytes_per_sector)
                     prev_chunk = b''
-                    
+
                     for _ in range(5000):
                         if ctx.cancel: break
                         raw_data = disk.read(1024 * 1024 * 16) # Читаем по 16 МБ
                         if not raw_data: break
-                            
+
                         buffer = prev_chunk + raw_data
                         idx = 0
-                        
+
                         # Двигаемся шагами по 32 байта (размер записи exFAT)
                         while idx <= len(buffer) - 32:
                             # 0x05 - Сигнатура удаленного файла в exFAT
                             if buffer[idx] == 0x05:
                                 sec_count = buffer[idx + 1] # Сколько записей идет следом
-                                
+
                                 if idx + (sec_count + 1) * 32 <= len(buffer):
                                     # Проверяем, что следующая запись - удаленный Stream Extension (0x40)
                                     if sec_count > 0 and buffer[idx + 32] == 0x40:
@@ -2151,7 +1952,7 @@ class CoreEngine:
                                             if buffer[entry_offset] == 0x41:
                                                 name_part = buffer[entry_offset+2 : entry_offset+32]
                                                 filename_chars.append(name_part)
-                                                
+
                                         if filename_chars:
                                             full_name_bytes = b"".join(filename_chars)
                                             try:
@@ -2167,16 +1968,16 @@ class CoreEngine:
                                     break # Хвост файла не влез в чанк, оставляем на следующий проход
                             else:
                                 idx += 32
-                                
+
                         prev_chunk = buffer[idx:]
                         if found_files % 5 == 0:
                             ctx.update(f"[exFAT] Поиск каскадных записей 0x05... Найдено: {found_files}")
                 else:
                     raise ValueError("Файловая система не поддерживается. Только NTFS / FAT32 / exFAT.")
-            
+
             if not ctx.cancel:
                 ctx.result = f"Анализ ФС завершен. Найдено {found_files} удаленных записей (см. Журнал)."
-                
+
         except Exception as e:
             self.logger.err(traceback.format_exc())
             ctx.error = str(e)
@@ -2193,14 +1994,14 @@ class CoreEngine:
             base_dir = Path(sys._MEIPASS)
         except Exception:
             base_dir = Path(os.path.abspath(__file__)).parent
-            
+
         yara_file = base_dir / "rules.yar"
         if not yara_file.exists():
             ctx.error = f"Файл правил не найден: {yara_file.name}. Создайте его в папке с программой!"
             return
 
         ctx.update("Компиляция YARA-правил...")
-        
+
         try:
             with open(yara_file, "r", encoding="utf-8") as f:
                 yara_source = f.read()
@@ -2231,12 +2032,12 @@ class CoreEngine:
                 prev_chunk = b''
                 while not ctx.cancel:
                     raw_data = disk.read(chunk_size)
-                    if not raw_data: 
+                    if not raw_data:
                         break
 
                     buffer = prev_chunk + raw_data
                     buffer_start_offset = scanned_bytes - len(prev_chunk) if scanned_bytes > 0 else 0
-                    
+
                     matches = rules.match(data=buffer)
                     for match in matches:
                         matches_found[match.rule] += 1
@@ -2250,7 +2051,7 @@ class CoreEngine:
                             else:
                                 # API >= 4.3.0
                                 extracted_instances = [(inst.offset, inst.matched_data) for inst in string_item.instances]
-                                
+
                             for string_offset, string_data in extracted_instances:
                                 abs_offset = buffer_start_offset + string_offset
 
@@ -2271,8 +2072,8 @@ class CoreEngine:
 
                     scanned_bytes += len(raw_data)
                     prev_chunk = raw_data[-overlap:] if len(raw_data) >= overlap else raw_data
-                    
-                    bar = self.ui.progress_bar( (scanned_bytes % 100) ) 
+
+                    bar = self.ui.progress_bar( (scanned_bytes % 100) )
                     total_m = sum(matches_found.values())
                     ctx.update(f"YARA Скан: {fmt_size(scanned_bytes)} {bar} Найдено: {total_m} (Сохраняются в файл...) ")
 
@@ -2282,7 +2083,7 @@ class CoreEngine:
                     ctx.result = f"Найдено: {res_str}. Отчет сохранен в папку {out_dir.name}!"
                 else:
                     ctx.result = "Скан завершен. Совпадений по YARA-правилам не найдено."
-                    report_path.unlink(missing_ok=True) 
+                    report_path.unlink(missing_ok=True)
                     out_dir.rmdir()
 
         except Exception as e:
@@ -2296,27 +2097,27 @@ class CoreEngine:
         path = f"\\\\.\\PhysicalDrive{d_num}"
         out_file = "deepdrive_raw_dump.img"
         written_bytes = 0
-        
+
         try:
             with open(path, "rb") as source, open(out_file, "wb") as target:
                 while not ctx.cancel:
                     chunk = source.read(1024 * 1024 * 16)
-                    if not chunk: 
+                    if not chunk:
                         break
-                        
+
                     target.write(chunk)
                     hasher.update(chunk)
                     written_bytes += len(chunk)
-                    
+
                     percent = (written_bytes / total_size) * 100
                     bar = self.ui.progress_bar(percent)
                     ctx.update(f"Дамп RAM: {percent:.1f}% {bar} {fmt_size(written_bytes)} / {fmt_size(total_size)}")
-                    
+
             if not ctx.cancel:
                 hash_hex = hasher.hexdigest()
                 self.logger.hash_log(out_file, hash_hex)
                 ctx.result = f"Дамп сохранен. SHA-256: {hash_hex}"
-        except Exception as e: 
+        except Exception as e:
             ctx.error = str(e)
 
 
@@ -2324,8 +2125,11 @@ class CoreEngine:
         """Исправленный DoD Wipe: затирание без системных ошибок."""
         hw = HardwareManager.get_hw_info(letter)
         d_num = hw['d_num']
-        total_size = hw['size'] 
-        
+        total_size = hw['size']
+
+        if HardwareManager.is_system_drive(d_num):
+            ctx.error = "ОШИБКА БЕЗОПАСНОСТИ: Попытка уничтожить системный диск Windows (C:)!"
+            return
         if d_num is None or total_size == 0:
             ctx.error = "Не удалось определить параметры диска."
             return
@@ -2338,24 +2142,24 @@ class CoreEngine:
             time.sleep(1)
 
             passes = [(b'\x00', "Проход 1/3 (Нули)"), (b'\xFF', "Проход 2/3 (Единицы)"), (None, "Проход 3/3 (Рандом)")]
-            
+
             fd = os.open(phys_path, os.O_RDWR | os.O_BINARY)
             try:
                 for p_data, p_name in passes:
                     if ctx.cancel: break
                     written = 0
                     os.lseek(fd, 0, os.SEEK_SET) # Возврат в начало
-                    
+
                     while written < total_size and not ctx.cancel:
                         chunk_size = 1024 * 1024 * 4 # 4MB чанки
                         data = p_data * chunk_size if p_data else os.urandom(chunk_size)
-                        
+
                         if total_size - written < chunk_size:
                             data = data[:total_size - written]
-                            
+
                         os.write(fd, data)
                         written += len(data)
-                        
+
                         percent = (written / total_size) * 100
                         ctx.update(f"{p_name}: {percent:.1f}% {self.ui.progress_bar(percent)}")
             finally:
@@ -2372,47 +2176,44 @@ class CoreEngine:
 
 
     def speed_test_worker(self, ctx: TaskContext, letter: str):
-        """Тестирование скорости линейного чтения с обнаружением битых секторов."""
+        """Тестирование скорости линейного чтения с ремапом битых секторов."""
         path = f"\\\\.\\{letter}"
         chunk_size = 1024 * 1024 * 16
         read_bytes = 0
         bad_sectors = 0
         start_time = time.time()
-        
         try:
-            with open(path, "rb") as disk:
+            fd = os.open(path, os.O_RDWR | os.O_BINARY)
+            try:
                 while not ctx.cancel:
                     try:
-                        chunk = disk.read(chunk_size)
-                        if not chunk: 
-                            break
-                            
+                        os.lseek(fd, read_bytes, os.SEEK_SET)
+                        chunk = os.read(fd, chunk_size)
+                        if not chunk: break
                         read_bytes += len(chunk)
                         elapsed = time.time() - start_time
                         speed = (read_bytes / 1024 / 1024) / elapsed if elapsed > 0 else 0
-
                         spinner = ['|', '/', '-', '\\'][int(time.time() * 10) % 4]
-                        # V2.2: цветовой индикатор скорости
                         speed_str = self.ui.color_speed(speed)
                         ctx.update(f"Тест Чтения {spinner}  Прочитано: {fmt_size(read_bytes)} | Скорость: {speed_str} | BAD: {bad_sectors}")
                     except OSError:
-                        # Если не удалось прочитать блок, записываем как ошибку I/O и прыгаем вперед
                         bad_sectors += 1
-                        disk.seek(chunk_size, 1)
-                        
-            if not ctx.cancel: 
-                ctx.result = f"Завершено. Прочитано: {fmt_size(read_bytes)}. BAD-блоков: {bad_sectors}"
-        except Exception as e: 
+                        try:
+                            os.lseek(fd, read_bytes, os.SEEK_SET)
+                            os.write(fd, b'\x00' * chunk_size)
+                        except OSError: pass
+                        finally: read_bytes += chunk_size
+            finally:
+                os.close(fd)
+            if not ctx.cancel: ctx.result = f"Завершено. Прочитано: {fmt_size(read_bytes)}. BAD-блоков: {bad_sectors}"
+        except Exception as e:
             ctx.error = str(e)
 
     def iso_flasher_worker(self, ctx: TaskContext, letter: str, d_num: int, iso_path: Path):
-        """
-        Усовершенствованный RAW-флешер (DD-режим).
-        Производит посекторную запись гибридных ISO-образов на физический диск
-        с расчетом ETA, буферизацией I/O и верификацией загрузочного сектора.
-        """
+        """Усовершенствованный RAW-флешер (DD-режим) с кольцевым буфером."""
+        import queue
         phys_path = f"\\\\.\\PhysicalDrive{d_num}"
-        
+
         try:
             iso_size = iso_path.stat().st_size
             if iso_size == 0:
@@ -2421,64 +2222,84 @@ class CoreEngine:
             ctx.update("Подготовка накопителя: Очистка таблиц разделов (Diskpart)...")
             dp_script = f"select disk {d_num}\nclean\nexit\n"
             subprocess.run(["diskpart"], input=dp_script.encode('utf-8'), stdout=subprocess.DEVNULL)
-            time.sleep(1.5) 
+            time.sleep(1.5)
 
-            chunk_size = 1024 * 1024 * 8 
+            chunk_size = 1024 * 1024 * 8
             written_bytes = 0
             start_time = time.time()
-            
-            with open(iso_path, "rb") as iso_file:
-                with open(phys_path, "wb") as disk:
-                    while not ctx.cancel:
-                        chunk = iso_file.read(chunk_size)
-                        if not chunk:
-                            break 
-                        
-                        disk.write(chunk)
-                        written_bytes += len(chunk)
 
-                        elapsed = time.time() - start_time
-                        if elapsed > 0.5: 
-                            speed_bps = written_bytes / elapsed
-                            speed_mbps = speed_bps / (1024 * 1024)
-                            
-                            bytes_left = iso_size - written_bytes
-                            eta_seconds = bytes_left / speed_bps if speed_bps > 0 else 0
-                            
-                            m, s = divmod(int(eta_seconds), 60)
-                            eta_str = f"{m:02d}м {s:02d}с"
-                            
-                            percent = (written_bytes / iso_size) * 100
-                            bar = self.ui.progress_bar(percent, width=30)
-                            spinner = ['|', '/', '-', '\\'][int(time.time() * 10) % 4]
-                            
-                            ctx.update(f"Запись {spinner} {percent:.1f}% {bar} {speed_mbps:.1f} МБ/с | Ост: {eta_str}")
+            q = queue.Queue(maxsize=16)
+
+            def reader():
+                try:
+                    with open(iso_path, "rb") as f:
+                        while not ctx.cancel:
+                            chunk = f.read(chunk_size)
+                            if not chunk:
+                                q.put(None)
+                                break
+                            q.put(chunk)
+                except Exception:
+                    q.put(None)
+
+            def writer():
+                nonlocal written_bytes
+                try:
+                    with open(phys_path, "wb") as f:
+                        while not ctx.cancel:
+                            chunk = q.get()
+                            if chunk is None:
+                                break
+                            f.write(chunk)
+                            written_bytes += len(chunk)
+                            q.task_done()
+                except Exception:
+                    ctx.cancel = True
+
+            r_thread = threading.Thread(target=reader, daemon=True)
+            w_thread = threading.Thread(target=writer, daemon=True)
+            r_thread.start()
+            w_thread.start()
+
+            while w_thread.is_alive():
+                elapsed = time.time() - start_time
+                if elapsed > 0.5:
+                    speed_bps = written_bytes / elapsed
+                    speed_mbps = speed_bps / (1024 * 1024)
+                    bytes_left = iso_size - written_bytes
+                    eta_seconds = bytes_left / speed_bps if speed_bps > 0 else 0
+                    m, s = divmod(int(eta_seconds), 60)
+                    eta_str = f"{m:02d}м {s:02d}с"
+                    percent = (written_bytes / iso_size) * 100
+                    bar = self.ui.progress_bar(percent, width=30)
+                    spinner = ['|', '/', '-', '\\'][int(time.time() * 10) % 4]
+                    ctx.update(f"Запись {spinner} {percent:.1f}% {bar} {speed_mbps:.1f} МБ/с | Ост: {eta_str}")
+                time.sleep(0.1)
+
+            r_thread.join()
+            w_thread.join()
 
             if ctx.cancel:
-                ctx.error = "Операция прервана пользователем. Таблица разделов диска уничтожена."
+                ctx.error = "Операция прервана пользователем или аппаратная ошибка."
                 return
 
             ctx.update("Охлаждение буфера и верификация загрузочного сектора (LBA 0)...")
-            time.sleep(1) 
-            
+            time.sleep(1)
+
             with open(iso_path, "rb") as iso, open(phys_path, "rb") as disk:
                 iso_lba0 = iso.read(512)
                 disk_lba0 = disk.read(512)
-                
                 if iso_lba0 != disk_lba0:
                     raise IOError("КРИТИЧЕСКИЙ СБОЙ: Сигнатура загрузчика на диске не совпадает с ISO-образом.")
 
             ctx.update("Финализация: Переподключение подсистемы хранения...")
             subprocess.run(["powershell", "-NoProfile", "-Command", "Update-HostStorageCache"], capture_output=True)
 
-            ctx.result = f"ISO '{iso_path.name}' успешно развернут ({fmt_size(iso_size)}). Целостность подтверждена."
-
+            ctx.result = f"ISO '{iso_path.name}' успешно развернут ({fmt_size(iso_size)})."
         except PermissionError:
-            self.logger.err("Отказ в доступе при записи ISO.")
-            ctx.error = "Отказано в доступе (0x05). Убедитесь, что нет сторонних блокировок и антивирус не мешает RAW-записи."
+            ctx.error = "Отказано в доступе (0x05)."
         except Exception as e:
-            self.logger.err(f"Сбой записи ISO: {traceback.format_exc()}")
-            ctx.error = f"Аппаратная или программная ошибка: {e}"
+            ctx.error = f"Ошибка: {e}"
 
     def capacity_and_speed_test_worker(self, ctx: TaskContext, letter: str, d_num: int, total_size: int):
         """
@@ -2486,44 +2307,47 @@ class CoreEngine:
         Проверяет реальный объем, ищет битые сектора, замеряет скорость и пишет лог в CSV.
         ВНИМАНИЕ: УНИЧТОЖАЕТ ВСЕ ДАННЫЕ НА ДИСКЕ!
         """
+        if HardwareManager.is_system_drive(d_num):
+            ctx.error = "ОШИБКА БЕЗОПАСНОСТИ: Попытка форматировать системный диск Windows (C:)!"
+            return
         if self.write_block:
             ctx.error = "ОТКЛОНЕНО: Выключите Write-Blocker (Пункт 8) для проведения стресс-теста."
             return
 
         phys_path = f"\\\\.\\PhysicalDrive{d_num}"
         chunk_size = 1024 * 1024 * 8  # 8 МБ
-        
+
         # Получаем данные о железе для CSV отчета
         hw_info = HardwareManager.get_hw_info(letter)
-        
+
         write_speed_final = 0.0
         read_speed_final = 0.0
         corrupted_chunks = 0
-        
+
         try:
             # --- ФАЗА 1: ПОДГОТОВКА ---
             ctx.update("Подготовка: Блокировка тома и снятие ФС...")
-            with Win32DiskIO(phys_path) as io:
+            with Win32DiskIO(phys_path, force_write_blocker=self.write_block) as io:
                 if not io.lock_and_dismount():
                     raise OSError("Не удалось заблокировать том для эксклюзивного доступа.")
-                
+
                 with open(phys_path, "rb+") as disk:
                     # --- ФАЗА 2: ТЕСТ ЗАПИСИ ---
                     written_bytes = 0
                     start_time = time.time()
                     chunk_index = 0
-                    
+
                     while written_bytes < total_size and not ctx.cancel:
                         header = struct.pack("<8sQ", b"DEEPTEST", chunk_index)
-                        data = header + (b'\xAA' * (chunk_size - 16)) 
-                        
+                        data = header + (b'\xAA' * (chunk_size - 16))
+
                         if total_size - written_bytes < chunk_size:
                             data = data[:total_size - written_bytes]
-                            
+
                         disk.write(data)
                         written_bytes += len(data)
                         chunk_index += 1
-                        
+
                         elapsed = time.time() - start_time
                         if elapsed > 0.5:
                             speed_mb = (written_bytes / 1024 / 1024) / elapsed
@@ -2542,22 +2366,22 @@ class CoreEngine:
                     read_bytes = 0
                     start_time = time.time()
                     expected_index = 0
-                    
+
                     while read_bytes < total_size and not ctx.cancel:
                         read_size = min(chunk_size, total_size - read_bytes)
                         chunk = disk.read(read_size)
-                        
+
                         if not chunk:
                             break
-                        
+
                         if len(chunk) >= 16:
                             sig, idx = struct.unpack("<8sQ", chunk[:16])
                             if sig != b"DEEPTEST" or idx != expected_index:
                                 corrupted_chunks += 1
-                        
+
                         read_bytes += len(chunk)
                         expected_index += 1
-                        
+
                         elapsed = time.time() - start_time
                         if elapsed > 0.5:
                             speed_mb = (read_bytes / 1024 / 1024) / elapsed
@@ -2572,7 +2396,7 @@ class CoreEngine:
                     read_speed_final = (read_bytes / 1024 / 1024) / (time.time() - start_time)
 
             # --- ФАЗА 4: LOGGING, ФОРМАТИРОВАНИЕ И ИТОГИ ---
-            
+
             self.logger.log_batch_result(hw_info, total_size, write_speed_final, read_speed_final, corrupted_chunks, chunk_size)
 
             ctx.update("Сброс тома: Быстрое форматирование в exFAT...")
@@ -2589,13 +2413,179 @@ class CoreEngine:
             self.logger.err(traceback.format_exc())
             ctx.error = f"Сбой теста: {e}"
 
+
+    def vhd_mount_worker(self, ctx: TaskContext, vhd_path: str):
+        import ctypes
+        from ctypes import wintypes
+        try:
+            virtdisk = ctypes.windll.virtdisk
+            vst = type('VIRTUAL_STORAGE_TYPE', (ctypes.Structure,), {'_fields_': [("DeviceId", wintypes.ULONG), ("VendorId", ctypes.c_char * 16)]})()
+            vst.DeviceId = 3 if str(vhd_path).lower().endswith('.vhdx') else 2
+            vst.VendorId = (ctypes.c_char * 16)(*[0] * 16)
+            open_params = type('OPEN_VIRTUAL_DISK_PARAMETERS_V1', (ctypes.Structure,), {'_fields_': [("Version", wintypes.ULONG), ("RWDepth", wintypes.ULONG)]})()
+            open_params.Version = 1; open_params.RWDepth = 1
+            handle = wintypes.HANDLE()
+            res = virtdisk.OpenVirtualDisk(ctypes.byref(vst), ctypes.c_wchar_p(str(vhd_path)), 0x003F0000, 0, ctypes.byref(open_params), ctypes.byref(handle))
+            if res == 0:
+                attach_params = type('ATTACH_VIRTUAL_DISK_PARAMETERS_V1', (ctypes.Structure,), {'_fields_': [("Version", wintypes.ULONG)]})()
+                attach_params.Version = 1
+                res2 = virtdisk.AttachVirtualDisk(handle, None, 0x00000000, 0, ctypes.byref(attach_params), None)
+                if res2 == 0: ctx.result = "VHD/VHDX успешно примонтирован."
+                else: ctx.error = f"Ошибка AttachVirtualDisk: {res2}"
+            else: ctx.error = f"Ошибка OpenVirtualDisk: {res}"
+        except Exception as e: ctx.error = str(e)
+
+    def ram_capture_worker(self, ctx: TaskContext):
+        import urllib.request
+        ctx.update("Скачивание WinPmem...")
+        url = "https://github.com/Velocidex/WinPmem/releases/download/v3.0.rc3/winpmem_mini_x64_rc3.exe"
+        exe_path = "winpmem.exe"
+        dump_path = "physmem.raw"
+        try:
+            if not os.path.exists(exe_path): urllib.request.urlretrieve(url, exe_path)
+            ctx.update("Создание дампа RAM (это может занять время)...")
+            proc = subprocess.Popen([exe_path, dump_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            while proc.poll() is None and not ctx.cancel:
+                line = proc.stdout.readline()
+                if line: ctx.update(f"RAM Capture: {line.strip()[-50:]}")
+                time.sleep(0.1)
+            if ctx.cancel:
+                proc.terminate()
+                ctx.error = "Дамп отменен."
+            elif proc.returncode == 0: ctx.result = f"Дамп сохранен в {dump_path}"
+            else: ctx.error = f"Ошибка WinPmem: {proc.stderr.read()}"
+        except Exception as e: ctx.error = str(e)
+
+    def vss_mount_worker(self, ctx: TaskContext, letter: str):
+        try:
+            out = subprocess.check_output(["wmic", "shadowcopy", "get", "DeviceObject", "/format:csv"], text=True, stderr=subprocess.DEVNULL)
+            paths = [line.split(',')[1].strip() for line in out.splitlines() if line.strip() and "DeviceObject" not in line]
+            if not paths:
+                ctx.error = "Теневые копии не найдены."
+                return
+            shadow_path = paths[-1]
+            if not shadow_path.endswith("\\"): shadow_path += "\\"
+            link_path = f"{letter[0]}Shadow\\"
+            subprocess.check_call(["cmd", "/c", "mklink", "/d", link_path, shadow_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            ctx.result = f"Теневая копия примонтирована в {link_path}"
+        except Exception as e: ctx.error = str(e)
+
+
+    def build_driver_worker(self, ctx: TaskContext):
+        source = """
+#include <ntifs.h>
+#include <ntddk.h>
+
+#define DEEPDRIVE_DEVICE_NAME L"\\Device\\DeepDriveIo"
+#define DEEPDRIVE_DOS_DEVICE_NAME L"\\DosDevices\\DeepDriveIo"
+
+#define IOCTL_DEEPDRIVE_READ_PHYSICAL_MEM CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_DEEPDRIVE_WRITE_PHYSICAL_MEM CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+typedef struct _PHYSICAL_MEMORY_REQ {
+    LARGE_INTEGER Address;
+    ULONG Size;
+    UCHAR Data[1];
+} PHYSICAL_MEMORY_REQ, *PPHYSICAL_MEMORY_REQ;
+
+extern "C" {
+    DRIVER_INITIALIZE DriverEntry;
+    DRIVER_UNLOAD DeepDriveUnload;
+    __drv_dispatchType(IRP_MJ_CREATE) DRIVER_DISPATCH DeepDriveCreateClose;
+    __drv_dispatchType(IRP_MJ_CLOSE) DRIVER_DISPATCH DeepDriveCreateClose;
+    __drv_dispatchType(IRP_MJ_DEVICE_CONTROL) DRIVER_DISPATCH DeepDriveDeviceControl;
+}
+
+void DeepDriveUnload(PDRIVER_OBJECT DriverObject) {
+    UNICODE_STRING dosDeviceName;
+    RtlInitUnicodeString(&dosDeviceName, DEEPDRIVE_DOS_DEVICE_NAME);
+    IoDeleteSymbolicLink(&dosDeviceName);
+    IoDeleteDevice(DriverObject->DeviceObject);
+}
+
+NTSTATUS DeepDriveCreateClose(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
+    UNREFERENCED_PARAMETER(DeviceObject);
+    Irp->IoStatus.Status = STATUS_SUCCESS;
+    Irp->IoStatus.Information = 0;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS DeepDriveDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
+    UNREFERENCED_PARAMETER(DeviceObject);
+    PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(Irp);
+    NTSTATUS status = STATUS_INVALID_DEVICE_REQUEST;
+    ULONG info = 0;
+
+    ULONG controlCode = stack->Parameters.DeviceIoControl.IoControlCode;
+    PVOID buffer = Irp->AssociatedIrp.SystemBuffer;
+    ULONG inLength = stack->Parameters.DeviceIoControl.InputBufferLength;
+    ULONG outLength = stack->Parameters.DeviceIoControl.OutputBufferLength;
+
+    switch (controlCode) {
+        case IOCTL_DEEPDRIVE_READ_PHYSICAL_MEM: {
+            if (inLength >= offsetof(PHYSICAL_MEMORY_REQ, Data) && buffer != NULL) {
+                PPHYSICAL_MEMORY_REQ req = (PPHYSICAL_MEMORY_REQ)buffer;
+                if (outLength >= req->Size) {
+                    PHYSICAL_ADDRESS physAddr;
+                    physAddr.QuadPart = req->Address.QuadPart;
+                    PVOID mappedMem = MmMapIoSpace(physAddr, req->Size, MmNonCached);
+                    if (mappedMem) {
+                        RtlCopyMemory(req->Data, mappedMem, req->Size);
+                        MmUnmapIoSpace(mappedMem, req->Size);
+                        status = STATUS_SUCCESS;
+                        info = offsetof(PHYSICAL_MEMORY_REQ, Data) + req->Size;
+                    } else { status = STATUS_INSUFFICIENT_RESOURCES; }
+                } else { status = STATUS_BUFFER_TOO_SMALL; }
+            } else { status = STATUS_INVALID_PARAMETER; }
+            break;
+        }
+    }
+    Irp->IoStatus.Status = status;
+    Irp->IoStatus.Information = info;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return status;
+}
+
+extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
+    UNREFERENCED_PARAMETER(RegistryPath);
+    UNICODE_STRING deviceName, dosDeviceName;
+    PDEVICE_OBJECT deviceObject = NULL;
+    NTSTATUS status;
+
+    RtlInitUnicodeString(&deviceName, DEEPDRIVE_DEVICE_NAME);
+    RtlInitUnicodeString(&dosDeviceName, DEEPDRIVE_DOS_DEVICE_NAME);
+
+    status = IoCreateDevice(DriverObject, 0, &deviceName, FILE_DEVICE_UNKNOWN, FILE_DEVICE_SECURE_OPEN, FALSE, &deviceObject);
+    if (!NT_SUCCESS(status)) return status;
+
+    status = IoCreateSymbolicLink(&dosDeviceName, &deviceName);
+    if (!NT_SUCCESS(status)) { IoDeleteDevice(deviceObject); return status; }
+
+    DriverObject->MajorFunction[IRP_MJ_CREATE] = DeepDriveCreateClose;
+    DriverObject->MajorFunction[IRP_MJ_CLOSE] = DeepDriveCreateClose;
+    DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = DeepDriveDeviceControl;
+    DriverObject->DriverUnload = DeepDriveUnload;
+
+    return STATUS_SUCCESS;
+}
+"""
+        try:
+            out_file = "DeepDriveIo.cpp"
+            with open(out_file, "w", encoding="utf-8") as f:
+                f.write(source)
+            ctx.result = f"Исходный код драйвера экспортирован в {out_file}. Для компиляции нужен WDK. Для загрузки: bcdedit /set testsigning on."
+        except Exception as e:
+            ctx.error = str(e)
+
     def hardware_reconstruction_worker(self, ctx: TaskContext, d_num: int):
+
         """
         ПРОТОКОЛ НИЗКОУРОВНЕВОЙ РЕКОНСТРУКЦИИ (L1 RECOVERY).
         Принудительное восстановление аппаратной доступности и разметки.
         """
         ctx.update(f"Инициализация шины для PhysicalDrive{d_num}...")
-        
+
         commands = [
             "rescan",
             f"select disk {d_num}",
@@ -2609,29 +2599,29 @@ class CoreEngine:
             "assign",
             "exit"
         ]
-        
+
         script = "\n".join(commands)
-        
+
         try:
             ctx.update("Выполнение реконструкции геометрии (Diskpart)...")
             process = subprocess.Popen(
-                ["diskpart"], 
-                stdin=subprocess.PIPE, 
-                stdout=subprocess.PIPE, 
+                ["diskpart"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE
             )
-            
+
             stdout, stderr = process.communicate(input=script.encode('utf-8'), timeout=45)
-            
+
             # Обновление системного кэша томов
             subprocess.run(["powershell", "Update-HostStorageCache"], capture_output=True)
-            
+
             if process.returncode == 0:
                 ctx.result = f"РЕКОНСТРУКЦИЯ ЗАВЕРШЕНА: Накопитель PhysicalDrive{d_num} возвращен в рабочее состояние."
             else:
                 err = stderr.decode('cp866', errors='ignore')
                 ctx.error = f"Отказ оборудования: {err}"
-                
+
         except subprocess.TimeoutExpired:
             ctx.error = "ПРЕВЫШЕНО ВРЕМЯ ОЖИДАНИЯ: Контроллер диска не отвечает."
         except Exception as e:
@@ -2649,45 +2639,45 @@ class App:
         self.engine = CoreEngine(self.ui, self.logger, self.db)
         self.tgt_letter = None
         self.is_readonly_mode = False
-        self.op_state = "IDLE" 
+        self.op_state = "IDLE"
 
     def set_state_and_run(self, state: str, title: str, worker, danger: int, *args):
         """Обертка для безопасного запуска задач с автоматическим обновлением цели."""
         self.op_state = state
         self.ui.run_task(title, worker, danger, *args)
-        
+
         if danger == 2:
             self.ui.slow_print("  [*] Финализация: Переподключение логических путей...", "info")
-            time.sleep(2) 
-            self.tgt_letter = None 
+            time.sleep(2)
+            self.tgt_letter = None
             self.op_state = "IDLE"
             return
 
         if self.tgt_letter:
             if not self.check_alive():
                 self.tgt_letter = None
-        
+
         self.op_state = "IDLE"
 
     def check_alive(self):
         """Мощный BSoD с 3-мя уровнями тяжести и авто-возвратом сессии."""
-        if not self.tgt_letter: 
+        if not self.tgt_letter:
             return True
-            
+
         bitmask = ctypes.windll.kernel32.GetLogicalDrives()
         drive_idx = ord(self.tgt_letter[0].upper()) - 65
-        
+
         if not (bitmask & (1 << drive_idx)):
             lost_drive = self.tgt_letter
             self.tgt_letter = None
-            
+
             # --- Отрисовка BSoD ---
             sys.stdout.write("\033[44m\033[1;37m\033[2J\033[3J\033[H")
             sys.stdout.flush()
-            
+
             print("\n  A problem has been detected and DEEPDRIVE has halted current operations")
             print("  to prevent data corruption in your forensic session.\n")
-            
+
             if self.op_state == "CRITICAL":
                 print("  STOP CODE: FATAL_DRIVE_CORRUPTION_IMMINENT")
                 print(f"  [!!!] ОПАСНОЕ ИЗВЛЕЧЕНИЕ: Накопитель [{lost_drive}] выдернут во время записи/стирания!")
@@ -2710,12 +2700,12 @@ class App:
             print("  [Авто-Детект] Вы можете просто вставить накопитель обратно в USB-порт...")
 
             scanning_mode = False
-            
+
             while msvcrt.kbhit(): msvcrt.getch()
 
             while True:
                 current_bitmask = ctypes.windll.kernel32.GetLogicalDrives()
-                
+
                 # Авто-определение (Флешка вернулась на место)
                 if current_bitmask & (1 << drive_idx):
                     print(f"\n  [+] АППАРАТНОЕ ПРЕРЫВАНИЕ: Устройство {lost_drive} снова обнаружено!")
@@ -2723,21 +2713,21 @@ class App:
                     time.sleep(1.5)
                     self.tgt_letter = lost_drive
                     self.op_state = "IDLE"
-                    self.ui.apply_bg() 
-                    return True 
-                
+                    self.ui.apply_bg()
+                    return True
+
                 if msvcrt.kbhit():
                     key = msvcrt.getch()
                     if key == b'1':
                         self.op_state = "IDLE"
                         self.ui.apply_bg()
-                        return False 
+                        return False
                     elif key == b'2' and not scanning_mode:
                         scanning_mode = True
                         print("\n  [SCAN] Активный опрос шины запущен... Жду ответ от устройства.")
-                
+
                 time.sleep(0.1)
-            
+
         return True
 
     def dev_mode_menu(self):
@@ -3088,6 +3078,9 @@ class App:
                     _hdr(f"ИНФО: {custom_list[si]}")
                     _show_meta(m)
                     self.ui.pause()
+                elif sub_choice == 2:
+                    self.set_state_and_run("CRITICAL", "Экспорт драйвера", self.engine.build_driver_worker, 1)
+                    self.ui.pause()
 
                 elif choice == 4:  # === УДАЛИТЬ ===
                     if not custom_list:
@@ -3434,11 +3427,11 @@ class App:
             w, h = 80, 24
 
         sys.stdout.write("\033[?25l") # Скрыть курсор
-        
+
         # Эффект распада (Data Dissolve / Noise)
         chars = "01010101ABCDEF#!@$%^&*"
         matrix_colors = ["dim", "highlight", "text"]
-        
+
         frames = 35
         for f in range(frames):
             # В каждом кадре "повреждаем" случайные участки экрана
@@ -3449,14 +3442,14 @@ class App:
                 color = random.choice(matrix_colors)
                 # Рисуем "шум" в случайной позиции
                 sys.stdout.write(f"\033[{ry};{rx}H" + self.ui.c(char, color))
-            
+
             if f == frames // 2:
                 # В середине анимации выводим финальное сообщение
                 msg = "── SESSION TERMINATED ──"
                 pos_y = h // 2
                 pos_x = (w - len(msg)) // 2
                 sys.stdout.write(f"\033[{pos_y};{pos_x}H\033[1;5m" + self.ui.c(msg, "err") + "\033[0m")
-            
+
             sys.stdout.flush()
             time.sleep(0.03)
 
@@ -3470,17 +3463,17 @@ class App:
         self.ui.apply_bg()
         # Создаём Factory Reset пресет при первом запуске если не существует
         self.ui.settings.ensure_factory_reset_preset()
-        
+
         # ── V2.2: Кинематографичный Intro с параллельной загрузкой ───────────
         self.ui.clear()
-        
+
         logo_final = fr"""
-   ____                  ____       _           
-  / __ \___  ___  ____  / __ \_____(_)   _____  
- / / / / _ \/ _ \/ __ \/ / / / ___/ / | / / _ \ 
-/ /_/ /  __/  __/ /_/ / /_/ / /  / /| |/ /  __/ 
+   ____                  ____       _
+  / __ \___  ___  ____  / __ \_____(_)   _____
+ / / / / _ \/ _ \/ __ \/ / / / ___/ / | / / _ \
+/ /_/ /  __/  __/ /_/ / /_/ / /  / /| |/ /  __/
 \_____/\___/\___/ .___/_____/_/  /_/ |___/\___(_)
-              /_/                               
+              /_/
 """
         try:
             ts = os.get_terminal_size()
@@ -3491,12 +3484,12 @@ class App:
         lines = logo_final.strip("\n").split("\n")
         max_logo_w = max(len(l) for l in lines)
         start_y = term_height // 4
-        
+
         # Контекст для фоновой загрузки
         load_ctx = TaskContext()
         load_thread = threading.Thread(target=self.db.fetch_and_load, args=(load_ctx,), daemon=True)
         load_thread.start()
-        
+
         # Сетка для "сборки" логотипа
         grid = []
         for y, line in enumerate(lines):
@@ -3509,12 +3502,12 @@ class App:
                         "char": char,
                         "tx": target_x,
                         "ty": target_y,
-                        "curr": random.choice(".:*=+"), 
+                        "curr": random.choice(".:*=+"),
                         "done": False
                     })
                     # V2.2: Отрисовка "призрачного" контура для узнаваемости
                     sys.stdout.write(f"\033[{target_y};{target_x}H" + self.ui.c(char, "dim"))
-        
+
         sys.stdout.flush()
         time.sleep(0.5) # Пауза перед началом "сборки"
 
@@ -3522,19 +3515,19 @@ class App:
         frames = 80 # Удвоили длительность
         for f in range(frames):
             sys.stdout.write("\033[?25l") # Hide cursor
-            
+
             # Статус внизу
             status = load_ctx.get_status()
             status_line = f"Инициализация: {status}"
             sys.stdout.write(f"\033[{term_height-2};0H" + self.ui.c(status_line.center(term_width), "dim"))
-            
+
             # Прогресс сборки (нелинейный)
             progress = (f / frames) ** 1.5
-            
+
             for item in grid:
                 if item["done"]:
                     continue
-                    
+
                 # Вероятность закрепиться в этом кадре
                 if random.random() < progress * 1.2:
                     item["curr"] = item["char"]
@@ -3546,7 +3539,7 @@ class App:
 
                 # Печать символа
                 sys.stdout.write(f"\033[{item['ty']};{item['tx']}H" + self.ui.c(item["curr"], color))
-            
+
             sys.stdout.flush()
             # Чуть ускоряем кадры к концу для динамики
             wait = 0.057 - (f / frames) * 0.03
@@ -3556,7 +3549,7 @@ class App:
         for y, line in enumerate(lines):
             padding = (term_width - max_logo_w) // 2
             sys.stdout.write(f"\033[{start_y + y};{padding}H" + self.ui.c(line, "highlight"))
-        
+
         # Плавное появление @Machinist
         time.sleep(0.5)
         author = "@Machinist | V2.2 RELEASED".center(term_width)
@@ -3564,7 +3557,7 @@ class App:
         sys.stdout.write(f"\033[{start_y + len(lines) + 1};0H" + self.ui.c(author, "dim"))
         sys.stdout.write("\033[?25h")
         sys.stdout.flush()
-        
+
         # Ожидание загрузки если нужно
         while load_thread.is_alive():
             status = load_ctx.get_status()
@@ -3576,16 +3569,16 @@ class App:
         sys.stdout.write(f"\033[{term_height-1};0H" + self.ui.c("Нажмите любую клавишу для входа...".center(term_width), "highlight"))
         sys.stdout.flush()
         msvcrt.getch()
-        
+
         # ── ПЕРЕХОД К ПРАВАМ ДОСТУПА ─────────────────────────────────────────
         self.ui.clear()
         if not is_admin() and os.name == 'nt':
             options = ["Запросить права Администратора", "Продолжить в режиме [ТОЛЬКО ЧТЕНИЕ]"]
             choice = self.ui.menu("ОШИБКА ПРАВ ДОСТУПА", options, None, True, False)
-            
+
             if choice == 0:
                 if request_admin(): sys.exit(0)
-                
+
             self.is_readonly_mode = True
             self.logger.warn("Программа запущена в ограниченном режиме.")
         # ─────────────────────────────────────────────────────────────
@@ -3608,12 +3601,12 @@ class App:
 
         # Главный цикл
         while True:
-            if not self.check_alive(): 
+            if not self.check_alive():
                 continue
-                
+
             wb_state = "[ВКЛЮЧЕН]" if self.engine.write_block else "[ВЫКЛЮЧЕН]"
             categories[7] = f"8. ПРОГРАММНЫЙ БЛОКИРАТОР ЗАПИСИ: {wb_state}"
-            
+
             # Применяем overrides названий пунктов из загруженного пресета
             labels = self.ui.settings.menu_labels
             if labels:
@@ -3624,9 +3617,9 @@ class App:
                             categories[idx] = new_label
                     except (ValueError, IndexError):
                         pass
-            
+
             main_choice = self.ui.menu("ГЛАВНОЕ МЕНЮ", categories, self.tgt_letter, self.is_readonly_mode, self.engine.write_block)
-            
+
             # Защита от запуска аналитики без выбранного диска
             if main_choice in [1, 2, 3, 4, 5, 6, 7, 8] and not self.tgt_letter:
                 print(self.ui.c("\n  ⚠  Накопитель не выбран. Перейдите в пункт 1.", "warn"))
@@ -3637,12 +3630,12 @@ class App:
             if main_choice == 0:
                 self.ui.clear()
                 self.ui.header("ВЫБОР ЦЕЛЕВОГО УСТРОЙСТВА", self.is_readonly_mode, self.engine.write_block)
-                
+
                 drives = []
                 def fetch_task():
                     nonlocal drives
                     drives = HardwareManager.get_combined_usb_drives()
-                
+
                 t = threading.Thread(target=fetch_task)
                 t.start()
                 spinner = ['|', '/', '-', '\\']
@@ -3652,15 +3645,15 @@ class App:
                     sys.stdout.flush()
                     idx += 1
                     time.sleep(0.1)
-                
+
                 print(self.ui.c("\r  [+] Опрос контроллеров завершен.                                       \n", "ok"))
-                
+
                 options = [d['display'] for d in drives]
                 options.append("Сброс питания порта (USB Power Cycle)")
                 options.append("Назад")
-                
+
                 sub_choice = self.ui.menu("ВЫБОР ЦЕЛЕВОГО УСТРОЙСТВА", options, self.tgt_letter, self.is_readonly_mode, self.engine.write_block)
-                
+
                 if 0 <= sub_choice < len(drives):
                     selected = drives[sub_choice]
                     self.tgt_letter = f"{selected['letter']}:" if selected['letter'] else f"Disk #{selected['num']}"
@@ -3675,16 +3668,16 @@ class App:
                 options = ["Аппаратная сводка", "Парсер MBR/GPT", "Скан Энтропии (Крипто-Анализ)", "YARA-Скан (Поиск по правилам)", "Назад"]
                 sub_choice = self.ui.menu("АНАЛИТИКА", options, self.tgt_letter, self.is_readonly_mode, self.engine.write_block)
                 hw_base = HardwareManager.get_hw_info(self.tgt_letter) # Базовый инфо для доступа к d_num
-                
-                if sub_choice == 0: 
+
+                if sub_choice == 0:
                     self.ui.clear()
                     self.ui.header("АППАРАТНАЯ СВОДКА", self.is_readonly_mode, self.engine.write_block)
-                    
+
                     hw = {}
                     def fetch_hw():
                         nonlocal hw
                         hw = HardwareManager.get_hw_info(self.tgt_letter)
-                    
+
                     # Запускаем фоновый поток и крутим спиннер
                     t = threading.Thread(target=fetch_hw)
                     t.start()
@@ -3700,7 +3693,7 @@ class App:
                     sys.stdout.flush()
 
                     v_db, p_db = self.db.resolve(hw.get('vid', '0000'), hw.get('pid', '0000'))
-                    
+
                     if p_db == "НЕИЗВЕСТНЫЙ КОНТРОЛЛЕР" and hw.get('vendor') not in ['Unknown', 'Unknown Device', 'Неизвестное устройство']:
                         p_db = f"{hw.get('vendor')} (Универсальный контроллер)"
 
@@ -3712,11 +3705,11 @@ class App:
                         if saved:
                             print(self.ui.c(f"  ✓  Сохранено: {saved}", "ok"))
                     self.ui.pause()
-                
-                elif sub_choice == 1 and hw_base['d_num'] is not None: 
+
+                elif sub_choice == 1 and hw_base['d_num'] is not None:
                     self.engine.parse_mbr(hw_base['d_num'])
                     self.ui.pause()
-                elif sub_choice == 2 and hw_base['d_num'] is not None: 
+                elif sub_choice == 2 and hw_base['d_num'] is not None:
                     self.engine.check_encryption(hw_base['d_num'], hw_base['size'])
                     self.ui.pause()
                 elif sub_choice == 3:
@@ -3724,17 +3717,17 @@ class App:
                     self.ui.pause()
 
             elif main_choice == 2:
-                if self.is_readonly_mode: 
+                if self.is_readonly_mode:
                     continue
                 options = [
-                    "БЫСТРЫЙ ТЕСТ: Только скорость чтения", 
-                    "ГЛУБОКИЙ ТЕСТ: Проверка на фейковый объем (Запись + Чтение + Верификация)", 
+                    "БЫСТРЫЙ ТЕСТ: Только скорость чтения",
+                    "ГЛУБОКИЙ ТЕСТ: Проверка на фейковый объем (Запись + Чтение + Верификация)",
                     "Назад"
                 ]
                 sub_choice = self.ui.menu("ОТБРАКОВКА И БЕНЧМАРКИ", options, self.tgt_letter, self.is_readonly_mode, self.engine.write_block)
                 hw = HardwareManager.get_hw_info(self.tgt_letter)
-                
-                if sub_choice == 0: 
+
+                if sub_choice == 0:
                     self.set_state_and_run("READ", "Speed Test", self.engine.speed_test_worker, 1, self.tgt_letter)
                     self.ui.pause()
                 elif sub_choice == 1 and hw['d_num'] is not None:
@@ -3746,31 +3739,31 @@ class App:
 
             # 4. КЛОНИРОВАНИЕ
             elif main_choice == 3:
-                if self.is_readonly_mode: 
+                if self.is_readonly_mode:
                     continue
-                    
-                options = ["Снять RAW дамп памяти (С хэшированием SHA256)", "Запись загрузочного ISO-образа", "Назад"]
+
+                options = ["Снять RAW дамп памяти (С хэшированием SHA256)", "Запись загрузочного ISO-образа", "Собрать C++ драйвер", "Назад"]
                 sub_choice = self.ui.menu("ОБРАЗЫ И КЛОНИРОВАНИЕ", options, self.tgt_letter, self.is_readonly_mode, self.engine.write_block)
                 hw = HardwareManager.get_hw_info(self.tgt_letter)
-                
+
                 if sub_choice == 0 and hw['d_num'] is not None:
                     print(self.ui.c(f"\n  Требуется места: {fmt_size(hw['size'])}", "warn"))
                     if input(self.ui.c("  Начать клонирование? (Y/N) >> ", "highlight")).strip().lower() == 'y':
                         self.set_state_and_run("READ", "Клонирование RAW", self.engine.raw_image_dump_worker, 1, hw['d_num'], hw['size'])
                     self.ui.pause()
-                    
+
                 elif sub_choice == 1 and hw['d_num'] is not None:
-                    if self.engine.write_block: 
+                    if self.engine.write_block:
                         print(self.ui.c("  [-] ОТКЛОНЕНО: Включен программный Write-Blocker!", "err"))
                     else:
                         isos = list(Path('.').glob('*.iso'))
-                        if not isos: 
+                        if not isos:
                             print(self.ui.c("\n  [-] ISO файлы не найдены в папке программы.", "err"))
                         else:
                             print("")
-                            for i, iso in enumerate(isos): 
+                            for i, iso in enumerate(isos):
                                 print(f"    [{i}] {iso.name} ({fmt_size(iso.stat().st_size)})")
-                                
+
                             sel = input(self.ui.c("\n  Выберите номер ISO >> ", "highlight"))
                             if sel.isdigit() and 0 <= int(sel) < len(isos):
                                 if input(self.ui.c("  Введите 'BURN' для записи (Уничтожит данные!) >> ", "warn")) == "BURN":
@@ -3779,68 +3772,75 @@ class App:
 
             # 5. РЕДАКТОР РАЗДЕЛОВ
             elif main_choice == 4:
-                if self.is_readonly_mode: 
+                if self.is_readonly_mode:
                     continue
                 sub_choice = self.ui.menu("РЕДАКТОР РАЗДЕЛОВ", ["Форматирование тома (FAT32/exFAT/NTFS)", "Назад"], self.tgt_letter, self.is_readonly_mode, self.engine.write_block)
                 hw = HardwareManager.get_hw_info(self.tgt_letter)
-                if sub_choice == 0 and hw['d_num'] is not None: 
+                if sub_choice == 0 and hw['d_num'] is not None:
                     self.engine.partition_manager(hw['d_num'])
                     self.ui.pause()
 
            # 6. ВОССТАНОВЛЕНИЕ
             elif main_choice == 5:
                 options = [
-                    "Smart Carver (Сигнатурный поиск RAW)", 
-                    "Undelete Protocol (Восстановление MFT/FAT)", 
-                    "РЕКОНСТРУКЦИЯ (L1 Hardware Recovery)", 
+                    "Smart Carver (Сигнатурный поиск RAW)",
+                    "Undelete Protocol (Восстановление MFT/FAT)",
+                    "Монтирование VHD/VHDX",
+                    "Live RAM Capture",
+                    "Монтирование теневой копии (VSS)",
+                    "РЕКОНСТРУКЦИЯ (L1 Hardware Recovery)",
                     "Назад"
                 ]
                 sub_choice = self.ui.menu("МОДУЛЬ ВОССТАНОВЛЕНИЯ", options, self.tgt_letter, self.is_readonly_mode, self.engine.write_block)
-                
+
                 # Извлекаем номер диска из tgt_letter (хоть из "F:", хоть из "Disk #1")
                 hw = HardwareManager.get_hw_info(self.tgt_letter)
-                
-                if sub_choice == 2 and hw['d_num'] is not None:
+
+                if sub_choice == 5 and hw['d_num'] is not None:
                     print(self.ui.c("\n  [ВНИМАНИЕ] ЗАПУСК ПРОТОКОЛА АППАРАТНОЙ РЕКОНСТРУКЦИИ.", "warn"))
                     print("  Все текущие данные и таблицы разделов будут перезаписаны.")
                     if input(self.ui.c("  Подтвердить запуск? (Y/N) >> ", "highlight")).strip().lower() == 'y':
-                        # Передаем только номер диска d_num
                         self.set_state_and_run("CRITICAL", "Hardware Recovery", self.engine.hardware_reconstruction_worker, 2, hw['d_num'])
                     self.ui.pause()
-
-                if sub_choice == 0: 
-                    # Уровень опасности 1: Только чтение
+                elif sub_choice == 0:
                     self.set_state_and_run("READ", "Smart Carver", self.engine.carver_worker, 1, self.tgt_letter)
                     self.ui.pause()
                 elif sub_choice == 1:
-                    # Уровень опасности 1: Только чтение
                     self.set_state_and_run("READ", "ФС Сканер", self.engine.undelete_worker, 1, self.tgt_letter)
                     self.ui.pause()
                 elif sub_choice == 2:
-                    # Блок уже обработан выше (hardware_reconstruction_worker).
-                    pass
+                    vhd_path = input(self.ui.c("\n  Путь к VHD/VHDX файлу >> ", "info")).strip()
+                    if vhd_path: self.set_state_and_run("CRITICAL", "Монтирование VHD", self.engine.vhd_mount_worker, 2, vhd_path)
+                    self.ui.pause()
+                elif sub_choice == 3:
+                    self.set_state_and_run("READ", "RAM Capture", self.engine.ram_capture_worker, 1)
+                    self.ui.pause()
+                elif sub_choice == 4:
+                    if self.tgt_letter: self.set_state_and_run("READ", "VSS Mount", self.engine.vss_mount_worker, 1, self.tgt_letter)
+                    self.ui.pause()
+
 
             # 7. БЕЗОПАСНОСТЬ
             elif main_choice == 6:
-                if self.is_readonly_mode: 
+                if self.is_readonly_mode:
                     continue
                 options = ["Включить аппаратную защиту (Read-Only LOCK)", "Снять аппаратную защиту (UNLOCK)", "DoD 5220.22-M Wipe (Гарантированное уничтожение)", "Назад"]
                 sub_choice = self.ui.menu("БЕЗОПАСНОСТЬ И УНИЧТОЖЕНИЕ", options, self.tgt_letter, self.is_readonly_mode, self.engine.write_block)
                 hw = HardwareManager.get_hw_info(self.tgt_letter)
-                
-                if sub_choice == 0 and hw['d_num'] is not None: 
+
+                if sub_choice == 0 and hw['d_num'] is not None:
                     self.set_state_and_run("CRITICAL", "Установка защиты", self.engine.hardware_lock_worker, 2, hw['d_num'], True, self.tgt_letter)
                     self.ui.pause()
-                elif sub_choice == 1 and hw['d_num'] is not None: 
+                elif sub_choice == 1 and hw['d_num'] is not None:
                     self.set_state_and_run("CRITICAL", "Снятие защиты", self.engine.hardware_lock_worker, 2, hw['d_num'], False, self.tgt_letter)
                     self.ui.pause()
                 elif sub_choice == 2:
-                    if self.engine.write_block: 
+                    if self.engine.write_block:
                         print(self.ui.c("  [-] ОТКЛОНЕНО: Включен Write-Blocker!", "err"))
                     elif input(self.ui.c("  ВНИМАНИЕ! Введите 'DOD' для уничтожения >> ", "err")).strip().upper() == "DOD":
                         self.set_state_and_run("CRITICAL", "DoD Wipe", self.engine.dod_wipe_worker, 2, self.tgt_letter)
                     self.ui.pause()
-            
+
             # 8. WRITE-BLOCKER
             elif main_choice == 7:
                 self.ui.clear()
@@ -3853,7 +3853,7 @@ class App:
                 else:
                     self.engine.write_block = True
                     self.logger.info("Write-Blocker ВКЛЮЧЕН пользователем.")
-            
+
             # 9. RAW HEX VIEWER
             elif main_choice == 8:
                 hw = HardwareManager.get_hw_info(self.tgt_letter)
@@ -3866,14 +3866,14 @@ class App:
                     continue
                 viewer = HexViewer(self.ui, path, hw['size'])
                 viewer.view()
-                
+
             # 10. ЖУРНАЛ СЕССИИ
             elif main_choice == 9:
                 self.ui.clear()
                 self.ui.header(f"ЖУРНАЛ ОТЛАДКИ (Файл: {self.logger.log_file.name})", self.is_readonly_mode, self.engine.write_block)
                 count = self.ui.settings.get('log_tail_lines', 20)
                 lines = self.logger.read_logs_tail(count)
-                
+
                 print(self.ui.c(f"  --- Последние {count} записей ---", "dim"))
                 for line in lines:
                     if " - [ERROR]" in line:
@@ -3882,7 +3882,7 @@ class App:
                         print(f"  {self.ui.c(line, 'warn')}")
                     else:
                         print(f"  {self.ui.c(line, 'text')}")
-                
+
                 self.ui.pause()
 
             # 11. НАСТРОЙКИ (Ex-DEV MODE)
@@ -3898,7 +3898,7 @@ class App:
 
 if __name__ == "__main__":
     if os.name == 'nt':
-        try: 
+        try:
             App().run()
         except KeyboardInterrupt:
             sys.stdout.write("\033[0m\033[2J\033[3J\033[H")
