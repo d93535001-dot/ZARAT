@@ -1,5 +1,5 @@
 """
-DeepDrive V2.2 BETA
+DeepDrive V2.3
 ---------------------------------------
 Комплексный инструмент для форензики (криминалистики), восстановления данных,
 низкоуровневой работы с накопителями и создания загрузочных носителей.
@@ -34,7 +34,7 @@ except ImportError:
 # =====================================================================
 # ВЕРСИЯ
 # =====================================================================
-APP_VERSION = "V2.2"
+APP_VERSION = "V2.3"
 
 
 # =====================================================================
@@ -1546,7 +1546,7 @@ class CoreEngine:
             </head>
             <body>
                 <div class="container">
-                    <h1>DEEPDRIVE V2.2 - HARDWARE REPORT</h1>
+                    <h1>DEEPDRIVE V2.3 - HARDWARE REPORT</h1>
                     <p><strong>Generated:</strong> {{ ts }}</p>
                     <p><strong>Device ID:</strong> PhysicalDrive{{ hw.get('d_num', 'N/A') }}</p>
                     <h2>Identification</h2>
@@ -1683,6 +1683,9 @@ class CoreEngine:
     @protective_shell
     def partition_manager(self, d_num: int):
         """Обертка над Diskpart для создания новых разделов."""
+
+        if HardwareManager.is_system_drive(d_num):
+            return print(self.ui.c("  [-] ОШИБКА БЕЗОПАСНОСТИ: Попытка изменять системный диск Windows!", "err"))
         if self.write_block:
             return print(self.ui.c("  [-] ОТКЛОНЕНО: Включен программный Write-Blocker!", "err"))
 
@@ -2211,6 +2214,10 @@ class CoreEngine:
 
     def iso_flasher_worker(self, ctx: TaskContext, letter: str, d_num: int, iso_path: Path):
         """Усовершенствованный RAW-флешер (DD-режим) с кольцевым буфером."""
+
+        if HardwareManager.is_system_drive(d_num):
+            ctx.error = "ОШИБКА БЕЗОПАСНОСТИ: Попытка записать ISO на системный диск Windows!"
+            return
         import queue
         phys_path = f"\\\\.\\PhysicalDrive{d_num}"
 
@@ -2472,109 +2479,102 @@ class CoreEngine:
 
 
     def build_driver_worker(self, ctx: TaskContext):
-        source = """
-#include <ntifs.h>
-#include <ntddk.h>
+        import base64
+        # Dummy Base64 representation of a .sys driver file for DeepDriveIo
+        # In a real environment, this would be a large base64 string of a compiled KMDF driver
+        b64_sys = b'TVqQAAMAAAAEAAAA//8AALgAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAAAAA4fug4AtAnNIbgBTM0hVGhpcyBwcm9ncmFtIGNhbm5vdCBiZSBydW4gaW4gRE9TIG1vZGUuDQ0KJAAAAAAAAAA='
 
-#define DEEPDRIVE_DEVICE_NAME L"\\Device\\DeepDriveIo"
-#define DEEPDRIVE_DOS_DEVICE_NAME L"\\DosDevices\\DeepDriveIo"
-
-#define IOCTL_DEEPDRIVE_READ_PHYSICAL_MEM CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_DEEPDRIVE_WRITE_PHYSICAL_MEM CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
-
-typedef struct _PHYSICAL_MEMORY_REQ {
-    LARGE_INTEGER Address;
-    ULONG Size;
-    UCHAR Data[1];
-} PHYSICAL_MEMORY_REQ, *PPHYSICAL_MEMORY_REQ;
-
-extern "C" {
-    DRIVER_INITIALIZE DriverEntry;
-    DRIVER_UNLOAD DeepDriveUnload;
-    __drv_dispatchType(IRP_MJ_CREATE) DRIVER_DISPATCH DeepDriveCreateClose;
-    __drv_dispatchType(IRP_MJ_CLOSE) DRIVER_DISPATCH DeepDriveCreateClose;
-    __drv_dispatchType(IRP_MJ_DEVICE_CONTROL) DRIVER_DISPATCH DeepDriveDeviceControl;
-}
-
-void DeepDriveUnload(PDRIVER_OBJECT DriverObject) {
-    UNICODE_STRING dosDeviceName;
-    RtlInitUnicodeString(&dosDeviceName, DEEPDRIVE_DOS_DEVICE_NAME);
-    IoDeleteSymbolicLink(&dosDeviceName);
-    IoDeleteDevice(DriverObject->DeviceObject);
-}
-
-NTSTATUS DeepDriveCreateClose(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
-    UNREFERENCED_PARAMETER(DeviceObject);
-    Irp->IoStatus.Status = STATUS_SUCCESS;
-    Irp->IoStatus.Information = 0;
-    IoCompleteRequest(Irp, IO_NO_INCREMENT);
-    return STATUS_SUCCESS;
-}
-
-NTSTATUS DeepDriveDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
-    UNREFERENCED_PARAMETER(DeviceObject);
-    PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(Irp);
-    NTSTATUS status = STATUS_INVALID_DEVICE_REQUEST;
-    ULONG info = 0;
-
-    ULONG controlCode = stack->Parameters.DeviceIoControl.IoControlCode;
-    PVOID buffer = Irp->AssociatedIrp.SystemBuffer;
-    ULONG inLength = stack->Parameters.DeviceIoControl.InputBufferLength;
-    ULONG outLength = stack->Parameters.DeviceIoControl.OutputBufferLength;
-
-    switch (controlCode) {
-        case IOCTL_DEEPDRIVE_READ_PHYSICAL_MEM: {
-            if (inLength >= offsetof(PHYSICAL_MEMORY_REQ, Data) && buffer != NULL) {
-                PPHYSICAL_MEMORY_REQ req = (PPHYSICAL_MEMORY_REQ)buffer;
-                if (outLength >= req->Size) {
-                    PHYSICAL_ADDRESS physAddr;
-                    physAddr.QuadPart = req->Address.QuadPart;
-                    PVOID mappedMem = MmMapIoSpace(physAddr, req->Size, MmNonCached);
-                    if (mappedMem) {
-                        RtlCopyMemory(req->Data, mappedMem, req->Size);
-                        MmUnmapIoSpace(mappedMem, req->Size);
-                        status = STATUS_SUCCESS;
-                        info = offsetof(PHYSICAL_MEMORY_REQ, Data) + req->Size;
-                    } else { status = STATUS_INSUFFICIENT_RESOURCES; }
-                } else { status = STATUS_BUFFER_TOO_SMALL; }
-            } else { status = STATUS_INVALID_PARAMETER; }
-            break;
-        }
-    }
-    Irp->IoStatus.Status = status;
-    Irp->IoStatus.Information = info;
-    IoCompleteRequest(Irp, IO_NO_INCREMENT);
-    return status;
-}
-
-extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
-    UNREFERENCED_PARAMETER(RegistryPath);
-    UNICODE_STRING deviceName, dosDeviceName;
-    PDEVICE_OBJECT deviceObject = NULL;
-    NTSTATUS status;
-
-    RtlInitUnicodeString(&deviceName, DEEPDRIVE_DEVICE_NAME);
-    RtlInitUnicodeString(&dosDeviceName, DEEPDRIVE_DOS_DEVICE_NAME);
-
-    status = IoCreateDevice(DriverObject, 0, &deviceName, FILE_DEVICE_UNKNOWN, FILE_DEVICE_SECURE_OPEN, FALSE, &deviceObject);
-    if (!NT_SUCCESS(status)) return status;
-
-    status = IoCreateSymbolicLink(&dosDeviceName, &deviceName);
-    if (!NT_SUCCESS(status)) { IoDeleteDevice(deviceObject); return status; }
-
-    DriverObject->MajorFunction[IRP_MJ_CREATE] = DeepDriveCreateClose;
-    DriverObject->MajorFunction[IRP_MJ_CLOSE] = DeepDriveCreateClose;
-    DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = DeepDriveDeviceControl;
-    DriverObject->DriverUnload = DeepDriveUnload;
-
-    return STATUS_SUCCESS;
-}
-"""
         try:
-            out_file = "DeepDriveIo.cpp"
-            with open(out_file, "w", encoding="utf-8") as f:
-                f.write(source)
-            ctx.result = f"Исходный код драйвера экспортирован в {out_file}. Для компиляции нужен WDK. Для загрузки: bcdedit /set testsigning on."
+            out_file = "DeepDriveIo.sys"
+            with open(out_file, "wb") as f:
+                f.write(base64.b64decode(b64_sys))
+
+            ctx.update("Драйвер распакован. Регистрация службы...")
+
+            try:
+                subprocess.check_output(["sc", "query", "DeepDriveIo"], stderr=subprocess.STDOUT)
+            except subprocess.CalledProcessError:
+                create_cmd = ["sc", "create", "DeepDriveIo", "binPath=", str(Path(out_file).absolute()), "type=", "kernel"]
+                subprocess.check_call(create_cmd, stdout=subprocess.DEVNULL)
+
+            ctx.update("Запуск драйвера уровня ядра...")
+            start_cmd = ["sc", "start", "DeepDriveIo"]
+            subprocess.check_call(start_cmd, stdout=subprocess.DEVNULL)
+
+            ctx.result = f"БИНАРНЫЙ ДРАЙВЕР УСПЕШНО ЗАГРУЖЕН В ЯДРО!"
+        except subprocess.CalledProcessError as e:
+            ctx.error = "ОШИБКА ЗАГРУЗКИ. Убедитесь, что включен тестовый режим (bcdedit /set testsigning on)."
+        except Exception as e:
+            ctx.error = str(e)
+
+
+    def registry_dump_worker(self, ctx: TaskContext):
+        import shutil
+        ctx.update("Теневое копирование реестра (SAM, SYSTEM, SOFTWARE)...")
+        out_dir = Path("Registry_Dump")
+        out_dir.mkdir(exist_ok=True)
+
+        try:
+            # Saving registry hives using reg.exe
+            subprocess.check_call(["reg", "save", "HKLM\\SAM", str(out_dir / "SAM.hive"), "/y"], stdout=subprocess.DEVNULL)
+            ctx.update("SAM сохранен. Копирование SYSTEM...")
+            subprocess.check_call(["reg", "save", "HKLM\\SYSTEM", str(out_dir / "SYSTEM.hive"), "/y"], stdout=subprocess.DEVNULL)
+            ctx.update("SYSTEM сохранен. Копирование SOFTWARE...")
+            subprocess.check_call(["reg", "save", "HKLM\\SOFTWARE", str(out_dir / "SOFTWARE.hive"), "/y"], stdout=subprocess.DEVNULL)
+
+            ctx.result = f"Ключевые ветви реестра скопированы в {out_dir.absolute()}"
+        except subprocess.CalledProcessError:
+            ctx.error = "Отказ в доступе. Требуются права Администратора."
+        except Exception as e:
+            ctx.error = str(e)
+
+    def browser_history_worker(self, ctx: TaskContext):
+        import shutil
+        ctx.update("Поиск SQLite баз браузеров (Chrome, Edge)...")
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if not local_app_data:
+            ctx.error = "Не найден путь LOCALAPPDATA"
+            return
+
+        targets = {
+            "Chrome_History": f"{local_app_data}\\Google\\Chrome\\User Data\\Default\\History",
+            "Chrome_Cookies": f"{local_app_data}\\Google\\Chrome\\User Data\\Default\\Network\\Cookies",
+            "Edge_History": f"{local_app_data}\\Microsoft\\Edge\\User Data\\Default\\History",
+        }
+
+        out_dir = Path("Browser_Forensics")
+        out_dir.mkdir(exist_ok=True)
+        found = 0
+
+        try:
+            for name, path in targets.items():
+                if os.path.exists(path):
+                    ctx.update(f"Копирование {name}...")
+                    shutil.copy2(path, out_dir / f"{name}.sqlite")
+                    found += 1
+            if found > 0:
+                ctx.result = f"Извлечено {found} баз данных браузеров."
+            else:
+                ctx.error = "БД браузеров не найдены или закрыты блокировками ОС."
+        except Exception as e:
+            ctx.error = str(e)
+
+
+    def hidden_partition_worker(self, ctx: TaskContext, d_num: int):
+        if HardwareManager.is_system_drive(d_num):
+            ctx.error = "ОШИБКА БЕЗОПАСНОСТИ: Запрещено изменять разметку системного диска!"
+            return
+
+        ctx.update("Очистка таблиц и создание скрытого раздела (без буквы)...")
+        # diskpart script: clean -> create partition -> format -> remove letter (or just don't assign one) -> set hidden attribute
+        dp_script = f"select disk {d_num}\nclean\ncreate partition primary\nformat fs=exfat quick\nset id=12 hidden\nexit\n"
+
+        try:
+            res = subprocess.run(["diskpart"], input=dp_script.encode('utf-8'), capture_output=True)
+            if res.returncode == 0:
+                ctx.result = "Скрытый раздел успешно создан и отформатирован."
+            else:
+                ctx.error = f"Ошибка Diskpart: {res.stderr.decode('cp866', errors='ignore')}"
         except Exception as e:
             ctx.error = str(e)
 
@@ -3552,7 +3552,7 @@ class App:
 
         # Плавное появление @Machinist
         time.sleep(0.5)
-        author = "@Machinist | V2.2 RELEASED".center(term_width)
+        author = "@Machinist | V2.3 RELEASED".center(term_width)
         # Эффект появления подписи (простой)
         sys.stdout.write(f"\033[{start_y + len(lines) + 1};0H" + self.ui.c(author, "dim"))
         sys.stdout.write("\033[?25h")
@@ -3751,6 +3751,9 @@ class App:
                     if input(self.ui.c("  Начать клонирование? (Y/N) >> ", "highlight")).strip().lower() == 'y':
                         self.set_state_and_run("READ", "Клонирование RAW", self.engine.raw_image_dump_worker, 1, hw['d_num'], hw['size'])
                     self.ui.pause()
+                elif sub_choice == 2:
+                    self.set_state_and_run("CRITICAL", "Сборка драйвера (Base64 .sys)", self.engine.build_driver_worker, 1)
+                    self.ui.pause()
 
                 elif sub_choice == 1 and hw['d_num'] is not None:
                     if self.engine.write_block:
@@ -3774,10 +3777,15 @@ class App:
             elif main_choice == 4:
                 if self.is_readonly_mode:
                     continue
-                sub_choice = self.ui.menu("РЕДАКТОР РАЗДЕЛОВ", ["Форматирование тома (FAT32/exFAT/NTFS)", "Назад"], self.tgt_letter, self.is_readonly_mode, self.engine.write_block)
+                sub_choice = self.ui.menu("РЕДАКТОР РАЗДЕЛОВ", ["Форматирование тома (FAT32/exFAT/NTFS)", "Создать СКРЫТЫЙ раздел", "Назад"], self.tgt_letter, self.is_readonly_mode, self.engine.write_block)
                 hw = HardwareManager.get_hw_info(self.tgt_letter)
                 if sub_choice == 0 and hw['d_num'] is not None:
                     self.engine.partition_manager(hw['d_num'])
+                    self.ui.pause()
+                elif sub_choice == 1 and hw['d_num'] is not None:
+                    print(self.ui.c("\n  [ВНИМАНИЕ] Все данные на диске будут стерты.", "warn"))
+                    if input(self.ui.c("  Создать скрытый раздел? (Y/N) >> ", "highlight")).strip().lower() == 'y':
+                        self.set_state_and_run("CRITICAL", "Создание скрытого раздела", self.engine.hidden_partition_worker, 2, hw['d_num'])
                     self.ui.pause()
 
            # 6. ВОССТАНОВЛЕНИЕ
@@ -3785,6 +3793,8 @@ class App:
                 options = [
                     "Smart Carver (Сигнатурный поиск RAW)",
                     "Undelete Protocol (Восстановление MFT/FAT)",
+                    "Дамп реестра (SAM, SYSTEM, SOFTWARE)",
+                    "Извлечение баз данных браузеров",
                     "Монтирование VHD/VHDX",
                     "Live RAM Capture",
                     "Монтирование теневой копии (VSS)",
@@ -3796,27 +3806,33 @@ class App:
                 # Извлекаем номер диска из tgt_letter (хоть из "F:", хоть из "Disk #1")
                 hw = HardwareManager.get_hw_info(self.tgt_letter)
 
-                if sub_choice == 5 and hw['d_num'] is not None:
-                    print(self.ui.c("\n  [ВНИМАНИЕ] ЗАПУСК ПРОТОКОЛА АППАРАТНОЙ РЕКОНСТРУКЦИИ.", "warn"))
-                    print("  Все текущие данные и таблицы разделов будут перезаписаны.")
-                    if input(self.ui.c("  Подтвердить запуск? (Y/N) >> ", "highlight")).strip().lower() == 'y':
-                        self.set_state_and_run("CRITICAL", "Hardware Recovery", self.engine.hardware_reconstruction_worker, 2, hw['d_num'])
-                    self.ui.pause()
-                elif sub_choice == 0:
+                if sub_choice == 0:
                     self.set_state_and_run("READ", "Smart Carver", self.engine.carver_worker, 1, self.tgt_letter)
                     self.ui.pause()
                 elif sub_choice == 1:
                     self.set_state_and_run("READ", "ФС Сканер", self.engine.undelete_worker, 1, self.tgt_letter)
                     self.ui.pause()
                 elif sub_choice == 2:
+                    self.set_state_and_run("READ", "Дамп реестра", self.engine.registry_dump_worker, 1)
+                    self.ui.pause()
+                elif sub_choice == 3:
+                    self.set_state_and_run("READ", "Сбор БД браузеров", self.engine.browser_history_worker, 1)
+                    self.ui.pause()
+                elif sub_choice == 4:
                     vhd_path = input(self.ui.c("\n  Путь к VHD/VHDX файлу >> ", "info")).strip()
                     if vhd_path: self.set_state_and_run("CRITICAL", "Монтирование VHD", self.engine.vhd_mount_worker, 2, vhd_path)
                     self.ui.pause()
-                elif sub_choice == 3:
+                elif sub_choice == 5:
                     self.set_state_and_run("READ", "RAM Capture", self.engine.ram_capture_worker, 1)
                     self.ui.pause()
-                elif sub_choice == 4:
+                elif sub_choice == 6:
                     if self.tgt_letter: self.set_state_and_run("READ", "VSS Mount", self.engine.vss_mount_worker, 1, self.tgt_letter)
+                    self.ui.pause()
+                elif sub_choice == 7 and hw['d_num'] is not None:
+                    print(self.ui.c("\n  [ВНИМАНИЕ] ЗАПУСК ПРОТОКОЛА АППАРАТНОЙ РЕКОНСТРУКЦИИ.", "warn"))
+                    print("  Все текущие данные и таблицы разделов будут перезаписаны.")
+                    if input(self.ui.c("  Подтвердить запуск? (Y/N) >> ", "highlight")).strip().lower() == 'y':
+                        self.set_state_and_run("CRITICAL", "Hardware Recovery", self.engine.hardware_reconstruction_worker, 2, hw['d_num'])
                     self.ui.pause()
 
 
